@@ -83,12 +83,12 @@ impl DeviceIdProvider for RpiSerialProvider {
             Err(_) => return Ok(None),
         };
         for line in cpuinfo.lines() {
-            if let Some(rest) = line.strip_prefix("Serial") {
-                if let Some(val) = rest.split(':').nth(1) {
-                    let val = val.trim().to_string();
-                    if !val.is_empty() && val != "0000000000000000" {
-                        return Ok(Some(val));
-                    }
+            if let Some(rest) = line.strip_prefix("Serial")
+                && let Some(val) = rest.split(':').nth(1)
+            {
+                let val = val.trim().to_string();
+                if !val.is_empty() && val != "0000000000000000" {
+                    return Ok(Some(val));
                 }
             }
         }
