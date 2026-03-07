@@ -11,6 +11,7 @@ async fn probe_rat(socket_path: &str) -> bool {
     tokio::net::UnixStream::connect(socket_path).await.is_ok()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     mqtt_cfg: MqttConfig,
     intervals: IntervalConfig,
@@ -19,6 +20,7 @@ pub async fn run(
     tuf_url: Option<String>,
     artifacts_url: Option<String>,
     runtime: Option<RuntimeConfig>,
+    avocadoctl_socket: String,
 ) -> Result<()> {
     let rat_available = probe_rat(&tunnel_config.rat_socket_path).await;
     info!(rat_available, "rat probe complete");
@@ -52,6 +54,7 @@ pub async fn run(
     let mqtt_handle = tokio::spawn({
         let tunnels = active_tunnels.clone();
         let mut shutdown_rx = shutdown_rx;
+        let outbox_tx_loop = outbox_tx.clone();
         async move {
             loop {
                 match mqtt::connect_and_run(
@@ -60,12 +63,14 @@ pub async fn run(
                     tunnel_config.clone(),
                     tunnels.clone(),
                     &mut outbox_rx,
+                    &outbox_tx_loop,
                     &mut shutdown_rx,
                     rat_available,
                     &api_url,
                     tuf_url.as_deref(),
                     artifacts_url.as_deref(),
                     runtime.clone(),
+                    &avocadoctl_socket,
                 )
                 .await
                 {

@@ -33,12 +33,14 @@ pub async fn connect_and_run(
     tunnel_cfg: TunnelConfig,
     active_tunnels: ActiveTunnels,
     outbox: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    outbox_tx: &tokio::sync::mpsc::UnboundedSender<String>,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
     rat_available: bool,
     api_url: &str,
     tuf_url: Option<&str>,
     artifacts_url: Option<&str>,
     runtime: Option<RuntimeConfig>,
+    avocadoctl_socket: &str,
 ) -> Result<()> {
     let device_id = &cfg.username;
     let cmd_topic = format!("cmd/{device_id}");
@@ -131,6 +133,8 @@ pub async fn connect_and_run(
                             tuf_url,
                             artifacts_url,
                             &runtime,
+                            avocadoctl_socket,
+                            outbox_tx,
                         )
                         .await;
                         for reply in replies {
@@ -278,6 +282,8 @@ async fn handle_server_message(
     tuf_url: Option<&str>,
     artifacts_url: Option<&str>,
     _runtime: &Option<RuntimeConfig>,
+    avocadoctl_socket: &str,
+    outbox_tx: &tokio::sync::mpsc::UnboundedSender<String>,
 ) -> Vec<String> {
     let msg: serde_json::Value = match serde_json::from_str(text) {
         Ok(m) => m,
@@ -292,28 +298,24 @@ async fn handle_server_message(
             (Some(tuf), Some(_artifacts)) => {
                 info!(
                     tuf_url = tuf,
-                    "runtime update available — fetching TUF root.json"
+                    "runtime update available — calling avocadoctl via varlink"
                 );
-                let root_url = format!("{tuf}metadata/root.json");
+                let tuf = tuf.to_string();
                 let jwt = jwt.to_string();
-                let root_url_clone = root_url.clone();
+                let socket = avocadoctl_socket.to_string();
+                let tx = outbox_tx.clone();
                 tokio::spawn(async move {
-                    match reqwest::Client::new()
-                        .get(&root_url_clone)
-                        .bearer_auth(&jwt)
-                        .send()
-                        .await
-                    {
-                        Ok(resp) if resp.status().is_success() => {
-                            info!(url = %root_url_clone, status = %resp.status(), "TUF root.json fetched successfully");
-                        }
-                        Ok(resp) => {
-                            warn!(url = %root_url_clone, status = %resp.status(), "TUF root.json fetch rejected by CDN");
+                    let event = match varlink_add_from_url(&socket, &tuf, &jwt).await {
+                        Ok(()) => {
+                            info!("runtime update applied successfully");
+                            serde_json::json!({"type": "update_result", "success": true})
                         }
                         Err(e) => {
-                            warn!(url = %root_url_clone, "TUF root.json fetch failed: {e}");
+                            warn!("runtime update failed: {e}");
+                            serde_json::json!({"type": "update_result", "success": false, "error": e.to_string()})
                         }
-                    }
+                    };
+                    let _ = tx.send(event.to_string());
                 });
             }
             _ => warn!(
@@ -480,6 +482,50 @@ async fn handle_server_message(
 
         _ => vec![],
     }
+}
+
+/// Call avocadoctl's varlink AddFromUrl over the Unix socket.
+///
+/// The varlink wire protocol: send a NUL-terminated JSON request, read a
+/// NUL-terminated JSON response.  The socket address uses the `unix:` prefix
+/// (e.g. `unix:/run/avocado/avocadoctl.sock`).
+async fn varlink_add_from_url(
+    socket_addr: &str,
+    url: &str,
+    auth_token: &str,
+) -> anyhow::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let path = socket_addr.strip_prefix("unix:").unwrap_or(socket_addr);
+
+    let mut stream = tokio::net::UnixStream::connect(path)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to connect to avocadoctl socket {path}: {e}"))?;
+
+    let request = serde_json::json!({
+        "method": "org.avocado.Runtimes.AddFromUrl",
+        "parameters": { "url": url, "authToken": auth_token }
+    });
+    let mut payload = serde_json::to_vec(&request)?;
+    payload.push(0u8); // varlink message delimiter
+    stream.write_all(&payload).await?;
+    stream.shutdown().await?;
+
+    // Read response (NUL-terminated)
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await?;
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let resp: serde_json::Value = serde_json::from_slice(&buf[..end])
+        .map_err(|e| anyhow::anyhow!("invalid varlink response: {e}"))?;
+
+    if let Some(err) = resp.get("error") {
+        let reason = resp["parameters"]["reason"]
+            .as_str()
+            .unwrap_or("unknown error");
+        anyhow::bail!("{}: {}", err.as_str().unwrap_or("error"), reason);
+    }
+
+    Ok(())
 }
 
 /// Call rat over Unix socket, return the response JSON.

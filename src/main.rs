@@ -56,6 +56,7 @@ async fn main() -> Result<()> {
                 config.tuf_url,
                 config.artifacts_url,
                 config.runtime,
+                config.avocadoctl_socket,
             )
             .await?;
         }

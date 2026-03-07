@@ -28,6 +28,10 @@ pub struct AgentConfig {
     /// Populated from `/etc/avocado-release` or the `[runtime]` config section.
     #[serde(default)]
     pub runtime: Option<RuntimeConfig>,
+    /// Varlink socket address for avocadoctl runtime management.
+    /// Default: "unix:/run/avocado/avocadoctl.sock"
+    #[serde(default = "default_avocadoctl_socket")]
+    pub avocadoctl_socket: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +43,10 @@ pub struct RuntimeConfig {
 
 fn default_api_url() -> String {
     "http://localhost:3001".to_string()
+}
+
+fn default_avocadoctl_socket() -> String {
+    "unix:/run/avocado/avocadoctl.sock".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +140,7 @@ impl Default for AgentConfig {
             tuf_url: None,
             artifacts_url: None,
             runtime: None,
+            avocadoctl_socket: default_avocadoctl_socket(),
         }
     }
 }
