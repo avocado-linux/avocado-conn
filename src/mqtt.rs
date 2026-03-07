@@ -42,6 +42,11 @@ pub async fn connect_and_run(
     runtime: Option<RuntimeConfig>,
     avocadoctl_socket: &str,
 ) -> Result<()> {
+    // Read root version from avocadoctl (best-effort, don't fail if unavailable)
+    let root_version = varlink_get_root_version(avocadoctl_socket).await;
+    if let Some(v) = root_version {
+        info!(root_version = v, "read root.json version from avocadoctl");
+    }
     let device_id = &cfg.username;
     let cmd_topic = format!("cmd/{device_id}");
     let event_topic = format!("event/{device_id}");
@@ -98,7 +103,7 @@ pub async fn connect_and_run(
                         client
                             .publish(&presence_topic, QoS::AtMostOnce, false, [0x01u8])
                             .await?;
-                        // Send device shadow: capabilities + config + runtime reported on every connect.
+                        // Send device shadow: capabilities + config + runtime + tuf reported on every connect.
                         let mut shadow = serde_json::json!({
                             "type": "shadow",
                             "tunnels": rat_available,
@@ -108,6 +113,9 @@ pub async fn connect_and_run(
                             shadow["runtime_id"] = serde_json::json!(rt.id);
                             shadow["runtime_name"] = serde_json::json!(rt.name);
                             shadow["runtime_version"] = serde_json::json!(rt.version);
+                        }
+                        if let Some(v) = root_version {
+                            shadow["root_version"] = serde_json::json!(v);
                         }
                         client
                             .publish(&event_topic, QoS::AtLeastOnce, false, shadow.to_string())
@@ -135,6 +143,7 @@ pub async fn connect_and_run(
                             &runtime,
                             avocadoctl_socket,
                             outbox_tx,
+                            keepalive_secs,
                         )
                         .await;
                         for reply in replies {
@@ -284,6 +293,7 @@ async fn handle_server_message(
     _runtime: &Option<RuntimeConfig>,
     avocadoctl_socket: &str,
     outbox_tx: &tokio::sync::mpsc::UnboundedSender<String>,
+    keepalive_secs: u64,
 ) -> Vec<String> {
     let msg: serde_json::Value = match serde_json::from_str(text) {
         Ok(m) => m,
@@ -304,10 +314,29 @@ async fn handle_server_message(
                 let jwt = jwt.to_string();
                 let socket = avocadoctl_socket.to_string();
                 let tx = outbox_tx.clone();
+                let runtime_clone = _runtime.clone();
+                let keepalive = keepalive_secs;
+                let rat = rat_available;
                 tokio::spawn(async move {
                     let event = match varlink_add_from_url(&socket, &tuf, &jwt).await {
                         Ok(()) => {
                             info!("runtime update applied successfully");
+                            // Re-read root version after successful update and send updated shadow
+                            if let Some(new_rv) = varlink_get_root_version(&socket).await {
+                                info!(root_version = new_rv, "re-read root version after update");
+                                let mut shadow = serde_json::json!({
+                                    "type": "shadow",
+                                    "tunnels": rat,
+                                    "keepalive_secs": keepalive,
+                                    "root_version": new_rv,
+                                });
+                                if let Some(rt) = &runtime_clone {
+                                    shadow["runtime_id"] = serde_json::json!(rt.id);
+                                    shadow["runtime_name"] = serde_json::json!(rt.name);
+                                    shadow["runtime_version"] = serde_json::json!(rt.version);
+                                }
+                                let _ = tx.send(shadow.to_string());
+                            }
                             serde_json::json!({"type": "update_result", "success": true})
                         }
                         Err(e) => {
@@ -482,6 +511,47 @@ async fn handle_server_message(
 
         _ => vec![],
     }
+}
+
+/// Query the device's root.json version via avocadoctl's varlink Show method.
+///
+/// Returns `Some(version)` if root.json exists, `None` if unavailable.
+/// Best-effort — failures are logged but don't prevent startup.
+pub async fn varlink_get_root_version(socket_addr: &str) -> Option<u64> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let path = socket_addr.strip_prefix("unix:").unwrap_or(socket_addr);
+
+    let mut stream = match tokio::net::UnixStream::connect(path).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("varlink root version: failed to connect to {path}: {e}");
+            return None;
+        }
+    };
+
+    let request = serde_json::json!({
+        "method": "org.avocado.RootAuthority.Show",
+        "parameters": {}
+    });
+    let mut payload = serde_json::to_vec(&request).ok()?;
+    payload.push(0u8);
+    if stream.write_all(&payload).await.is_err() {
+        return None;
+    }
+    let _ = stream.shutdown().await;
+
+    let mut buf = Vec::new();
+    if stream.read_to_end(&mut buf).await.is_err() {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let resp: serde_json::Value = serde_json::from_slice(&buf[..end]).ok()?;
+
+    resp.get("parameters")
+        .and_then(|p| p.get("authority"))
+        .and_then(|a| a.get("version"))
+        .and_then(|v| v.as_u64())
 }
 
 /// Call avocadoctl's varlink AddFromUrl over the Unix socket.
