@@ -32,6 +32,33 @@ pub struct AgentConfig {
     /// Default: "unix:/run/avocado/avocadoctl.sock"
     #[serde(default = "default_avocadoctl_socket")]
     pub avocadoctl_socket: String,
+
+    /// Claim token for initial device provisioning.
+    /// If present and no saved credentials exist, the daemon will self-claim
+    /// by calling POST {api_url}/api/device/claim.
+    #[serde(default)]
+    pub claim_token: Option<String>,
+    /// Device ID provider name. Required when `claim_token` is set.
+    /// Built-in: "dmi", "devicetree-serial", "rpi-serial", "imx-uid", "nic-mac"
+    /// External: "file:<path>", "uboot-env:<var>", "exec:<path> [args...]"
+    #[serde(default)]
+    pub device_id_source: Option<String>,
+    /// MQTT broker host for device connections (used after claiming).
+    #[serde(default = "default_mqtt_host")]
+    pub mqtt_host: String,
+    /// MQTT broker port for device connections (used after claiming).
+    #[serde(default = "default_mqtt_port")]
+    pub mqtt_port: u16,
+}
+
+/// Credentials and metadata persisted after a successful device claim.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaimedState {
+    pub device_id: String,
+    pub mqtt: MqttConfig,
+    pub tuf_url: Option<String>,
+    pub artifacts_url: Option<String>,
+    pub claimed_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,6 +168,10 @@ impl Default for AgentConfig {
             artifacts_url: None,
             runtime: None,
             avocadoctl_socket: default_avocadoctl_socket(),
+            claim_token: None,
+            device_id_source: None,
+            mqtt_host: default_mqtt_host(),
+            mqtt_port: default_mqtt_port(),
         }
     }
 }
@@ -165,19 +196,105 @@ impl AgentConfig {
         Ok(config)
     }
 
-    /// Resolve the MQTT config or fail with a clear error.
-    pub fn resolve_mqtt(&self) -> Result<crate::config::MqttConfig> {
-        self.mqtt.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Missing [mqtt] section in config.toml.\n\
-                 Add the credentials returned by the device claim API:\n\
-                 [mqtt]\n\
-                 host = \"<broker-host>\"\n\
-                 port = 1883\n\
-                 username = \"<device-uuid>\"\n\
-                 password = \"<raw-mqtt-password>\"\n\
-                 client_id = \"device-<device-uuid>\""
-            )
-        })
+    /// Resolve the MQTT config: check [mqtt] section first, then saved claim
+    /// state, then error.
+    pub fn resolve_mqtt(&self) -> Result<MqttConfig> {
+        if let Some(mqtt) = &self.mqtt {
+            return Ok(mqtt.clone());
+        }
+        if let Some(state) = self.load_claimed_state()? {
+            return Ok(state.mqtt);
+        }
+        if self.claim_token.is_some() {
+            anyhow::bail!(
+                "Claim token present but device not yet claimed. \
+                 The claim flow will run automatically."
+            );
+        }
+        anyhow::bail!(
+            "Missing [mqtt] section in config.toml.\n\
+             Add the credentials returned by the device claim API:\n\
+             [mqtt]\n\
+             host = \"<broker-host>\"\n\
+             port = 1883\n\
+             username = \"<device-uuid>\"\n\
+             password = \"<raw-mqtt-password>\"\n\
+             client_id = \"device-<device-uuid>\""
+        )
+    }
+
+    /// Validate that required fields are present when claim_token is set.
+    pub fn validate_claim_config(&self) -> Result<()> {
+        if self.claim_token.is_some() {
+            if self.data_dir.is_none() {
+                anyhow::bail!(
+                    "data_dir must be set when using claim_token. \
+                     Set data_dir to a persistent writable directory, \
+                     e.g. data_dir = \"/var/lib/avocado/connect\""
+                );
+            }
+            if self.device_id_source.is_none() {
+                anyhow::bail!(
+                    "device_id_source must be set when using claim_token.\n\
+                     Built-in providers: \"dmi\", \"devicetree-serial\", \
+                     \"rpi-serial\", \"imx-uid\", \"nic-mac\"\n\
+                     External: \"file:<path>\", \"uboot-env:<var>\", \
+                     \"exec:<path> [args...]\""
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Path to the saved claim state file inside data_dir.
+    pub fn state_file_path(&self) -> Option<PathBuf> {
+        self.data_dir
+            .as_ref()
+            .map(|d| PathBuf::from(d).join("claimed_state.json"))
+    }
+
+    /// Load previously saved claim credentials from disk.
+    pub fn load_claimed_state(&self) -> Result<Option<ClaimedState>> {
+        match self.state_file_path() {
+            Some(path) if path.exists() => {
+                let data = fs::read_to_string(&path)
+                    .with_context(|| format!("reading {}", path.display()))?;
+                let state: ClaimedState = serde_json::from_str(&data)
+                    .with_context(|| format!("parsing {}", path.display()))?;
+                Ok(Some(state))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Atomically persist claim credentials to disk.
+    pub fn save_claimed_state(&self, state: &ClaimedState) -> Result<()> {
+        let path = self
+            .state_file_path()
+            .ok_or_else(|| anyhow::anyhow!("data_dir must be set to save claim state"))?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let tmp = path.with_extension("tmp");
+        let data = serde_json::to_string_pretty(state)?;
+        fs::write(&tmp, &data).with_context(|| format!("writing {}", tmp.display()))?;
+        fs::rename(&tmp, &path)
+            .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
+    }
+
+    /// Check if the device has already been claimed (state file exists).
+    pub fn is_claimed(&self) -> bool {
+        self.state_file_path().map(|p| p.exists()).unwrap_or(false)
+    }
+
+    /// Check if claim-based provisioning is configured.
+    pub fn needs_claim(&self) -> bool {
+        self.claim_token.is_some() && !self.is_claimed()
     }
 }
