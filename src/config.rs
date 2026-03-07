@@ -147,12 +147,12 @@ impl Default for AgentConfig {
 
 impl AgentConfig {
     pub fn default_path() -> Result<PathBuf> {
-        if let Ok(p) = std::env::var("AVOCADO_DAEMON_CONFIG") {
+        if let Ok(p) = std::env::var("AVOCADO_CONN_CONFIG") {
             return Ok(PathBuf::from(p));
         }
         let dir = dirs::config_dir()
             .context("Could not determine config directory")?
-            .join("avocado-daemon");
+            .join("avocado-conn");
         Ok(dir.join("config.toml"))
     }
 

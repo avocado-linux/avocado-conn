@@ -10,7 +10,7 @@ mod mqtt;
 use config::AgentConfig;
 
 #[derive(Parser)]
-#[command(name = "avocado-daemon", about = "Avocado Connect device daemon")]
+#[command(name = "avocado-conn", about = "Avocado Connect device daemon")]
 struct Cli {
     /// Path to config file
     #[arg(long, global = true)]
@@ -47,7 +47,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Run => {
             let mqtt_cfg = config.resolve_mqtt()?;
-            info!(host = %mqtt_cfg.host, port = mqtt_cfg.port, "starting avocado-daemon");
+            info!(host = %mqtt_cfg.host, port = mqtt_cfg.port, "starting avocado-conn");
             agent::run(
                 mqtt_cfg,
                 config.intervals,

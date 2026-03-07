@@ -1,10 +1,10 @@
 [package]
-name = "avocado-con"
+name = "avocado-conn"
 version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "avocado-con"
+name = "avocado-conn"
 path = "src/main.rs"
 
 [dependencies]
