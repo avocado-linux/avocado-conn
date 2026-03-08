@@ -49,6 +49,10 @@ pub struct AgentConfig {
     /// MQTT broker port for device connections (used after claiming).
     #[serde(default = "default_mqtt_port")]
     pub mqtt_port: u16,
+    /// Directory where TUF metadata (root.json) is stored.
+    /// Must align with where avocadoctl expects to find root.json.
+    #[serde(default = "default_metadata_dir")]
+    pub metadata_dir: String,
 }
 
 /// Credentials and metadata persisted after a successful device claim.
@@ -93,6 +97,10 @@ fn default_mqtt_host() -> String {
 
 fn default_mqtt_port() -> u16 {
     1883
+}
+
+fn default_metadata_dir() -> String {
+    "/var/lib/avocado/metadata".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,6 +180,7 @@ impl Default for AgentConfig {
             device_id_source: None,
             mqtt_host: default_mqtt_host(),
             mqtt_port: default_mqtt_port(),
+            metadata_dir: default_metadata_dir(),
         }
     }
 }

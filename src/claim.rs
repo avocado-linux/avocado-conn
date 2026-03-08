@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
@@ -30,6 +30,9 @@ struct ClaimData {
     mqtt: ClaimMqtt,
     tuf_url: Option<String>,
     artifacts_url: Option<String>,
+    /// Signed root.json envelope for trust initialization (Level 0 TOFU).
+    /// Present when the org has TUF configured on the server.
+    root_json: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -71,6 +74,25 @@ fn is_permanent_error(msg: &str) -> bool {
 // Single claim attempt
 // ---------------------------------------------------------------------------
 
+/// Write root.json from the claim response to the metadata directory.
+/// Creates `root.json` and `1.root.json` (TUF versioned copy).
+fn write_root_json(metadata_dir: &str, root_json: &str) -> Result<()> {
+    let dir = std::path::Path::new(metadata_dir);
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("creating metadata dir {}", dir.display()))?;
+
+    let root_path = dir.join("root.json");
+    let versioned_path = dir.join("1.root.json");
+
+    std::fs::write(&root_path, root_json)
+        .with_context(|| format!("writing {}", root_path.display()))?;
+    std::fs::write(&versioned_path, root_json)
+        .with_context(|| format!("writing {}", versioned_path.display()))?;
+
+    info!(path = %root_path.display(), "wrote root.json from claim response");
+    Ok(())
+}
+
 /// Execute a single claim attempt against the API.
 pub async fn claim(config: &AgentConfig) -> Result<ClaimedState> {
     let token = config
@@ -108,6 +130,13 @@ pub async fn claim(config: &AgentConfig) -> Result<ClaimedState> {
             .json()
             .await
             .map_err(|e| anyhow::anyhow!("parsing claim response: {e}"))?;
+
+        // Write root.json to metadata dir if provided (Level 0 TOFU)
+        if let Some(ref root_json) = body.data.root_json
+            && let Err(e) = write_root_json(&config.metadata_dir, root_json)
+        {
+            warn!(error = %e, "failed to write root.json from claim response");
+        }
 
         let state = ClaimedState {
             device_id: body.data.device.id,
