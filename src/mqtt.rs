@@ -305,12 +305,14 @@ async fn handle_server_message(
     // config (set during provisioning) — the API is not in the runtime fetch path.
     if msg["type"].as_u64() == Some(0) {
         match (tuf_url, artifacts_url) {
-            (Some(tuf), Some(_artifacts)) => {
+            (Some(tuf), Some(artifacts)) => {
                 info!(
                     tuf_url = tuf,
+                    artifacts_url = artifacts,
                     "runtime update available — calling avocadoctl via varlink"
                 );
                 let tuf = tuf.to_string();
+                let artifacts = artifacts.to_string();
                 let jwt = jwt.to_string();
                 let socket = avocadoctl_socket.to_string();
                 let tx = outbox_tx.clone();
@@ -318,7 +320,9 @@ async fn handle_server_message(
                 let keepalive = keepalive_secs;
                 let rat = rat_available;
                 tokio::spawn(async move {
-                    let event = match varlink_add_from_url(&socket, &tuf, &jwt).await {
+                    let event = match varlink_add_from_url(&socket, &tuf, &jwt, Some(&artifacts))
+                        .await
+                    {
                         Ok(()) => {
                             info!("runtime update applied successfully");
                             // Re-read root version after successful update and send updated shadow
@@ -563,6 +567,7 @@ async fn varlink_add_from_url(
     socket_addr: &str,
     url: &str,
     auth_token: &str,
+    artifacts_url: Option<&str>,
 ) -> anyhow::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -572,9 +577,13 @@ async fn varlink_add_from_url(
         .await
         .map_err(|e| anyhow::anyhow!("failed to connect to avocadoctl socket {path}: {e}"))?;
 
+    let mut params = serde_json::json!({ "url": url, "authToken": auth_token });
+    if let Some(art_url) = artifacts_url {
+        params["artifactsUrl"] = serde_json::json!(art_url);
+    }
     let request = serde_json::json!({
         "method": "org.avocado.Runtimes.AddFromUrl",
-        "parameters": { "url": url, "authToken": auth_token }
+        "parameters": params
     });
     let mut payload = serde_json::to_vec(&request)?;
     payload.push(0u8); // varlink message delimiter
