@@ -47,6 +47,19 @@ pub async fn connect_and_run(
     if let Some(v) = root_version {
         info!(root_version = v, "read root.json version from avocadoctl");
     }
+    // Query active runtime from avocadoctl (overrides config if available)
+    let runtime = match varlink_get_active_runtime(avocadoctl_socket).await {
+        Some(rt) => {
+            info!(runtime_name = ?rt.name, runtime_version = ?rt.version, "read active runtime from avocadoctl");
+            Some(rt)
+        }
+        None => {
+            if runtime.is_some() {
+                info!("using runtime from config");
+            }
+            runtime
+        }
+    };
     let device_id = &cfg.username;
     let cmd_topic = format!("cmd/{device_id}");
     let event_topic = format!("event/{device_id}");
@@ -325,22 +338,29 @@ async fn handle_server_message(
                     {
                         Ok(()) => {
                             info!("runtime update applied successfully");
-                            // Re-read root version after successful update and send updated shadow
-                            if let Some(new_rv) = varlink_get_root_version(&socket).await {
-                                info!(root_version = new_rv, "re-read root version after update");
-                                let mut shadow = serde_json::json!({
-                                    "type": "shadow",
-                                    "tunnels": rat,
-                                    "keepalive_secs": keepalive,
-                                    "root_version": new_rv,
-                                });
-                                if let Some(rt) = &runtime_clone {
-                                    shadow["runtime_id"] = serde_json::json!(rt.id);
-                                    shadow["runtime_name"] = serde_json::json!(rt.name);
-                                    shadow["runtime_version"] = serde_json::json!(rt.version);
-                                }
-                                let _ = tx.send(shadow.to_string());
+                            // Re-read root version and active runtime after update, send updated shadow
+                            let new_rv = varlink_get_root_version(&socket).await;
+                            let new_rt = varlink_get_active_runtime(&socket).await;
+                            let mut shadow = serde_json::json!({
+                                "type": "shadow",
+                                "tunnels": rat,
+                                "keepalive_secs": keepalive,
+                            });
+                            if let Some(v) = new_rv {
+                                info!(root_version = v, "re-read root version after update");
+                                shadow["root_version"] = serde_json::json!(v);
                             }
+                            if let Some(ref rt) = new_rt {
+                                info!(runtime_name = ?rt.name, runtime_version = ?rt.version, "re-read active runtime after update");
+                                shadow["runtime_id"] = serde_json::json!(rt.id);
+                                shadow["runtime_name"] = serde_json::json!(rt.name);
+                                shadow["runtime_version"] = serde_json::json!(rt.version);
+                            } else if let Some(rt) = &runtime_clone {
+                                shadow["runtime_id"] = serde_json::json!(rt.id);
+                                shadow["runtime_name"] = serde_json::json!(rt.name);
+                                shadow["runtime_version"] = serde_json::json!(rt.version);
+                            }
+                            let _ = tx.send(shadow.to_string());
                             serde_json::json!({"type": "update_result", "success": true})
                         }
                         Err(e) => {
@@ -556,6 +576,65 @@ pub async fn varlink_get_root_version(socket_addr: &str) -> Option<u64> {
         .and_then(|p| p.get("authority"))
         .and_then(|a| a.get("version"))
         .and_then(|v| v.as_u64())
+}
+
+/// Query the active runtime via avocadoctl's varlink List method.
+///
+/// Returns `Some(RuntimeConfig)` with the active runtime's id/name/version,
+/// or `None` if unavailable. Best-effort — failures are logged but don't
+/// prevent startup.
+pub async fn varlink_get_active_runtime(socket_addr: &str) -> Option<RuntimeConfig> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let path = socket_addr.strip_prefix("unix:").unwrap_or(socket_addr);
+
+    let mut stream = match tokio::net::UnixStream::connect(path).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("varlink active runtime: failed to connect to {path}: {e}");
+            return None;
+        }
+    };
+
+    let request = serde_json::json!({
+        "method": "org.avocado.Runtimes.List",
+        "parameters": {}
+    });
+    let mut payload = serde_json::to_vec(&request).ok()?;
+    payload.push(0u8);
+    if stream.write_all(&payload).await.is_err() {
+        return None;
+    }
+    let _ = stream.shutdown().await;
+
+    let mut buf = Vec::new();
+    if stream.read_to_end(&mut buf).await.is_err() {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let resp: serde_json::Value = serde_json::from_slice(&buf[..end]).ok()?;
+
+    let runtimes = resp
+        .get("parameters")
+        .and_then(|p| p.get("runtimes"))
+        .and_then(|r| r.as_array())?;
+
+    let active = runtimes
+        .iter()
+        .find(|rt| rt.get("active").and_then(|a| a.as_bool()).unwrap_or(false))?;
+
+    let id = active.get("id").and_then(|v| v.as_str()).map(String::from);
+    let runtime_info = active.get("runtime");
+    let name = runtime_info
+        .and_then(|r| r.get("name"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let version = runtime_info
+        .and_then(|r| r.get("version"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    Some(RuntimeConfig { id, name, version })
 }
 
 /// Call avocadoctl's varlink AddFromUrl over the Unix socket.
