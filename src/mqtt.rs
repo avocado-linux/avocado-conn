@@ -405,6 +405,7 @@ async fn handle_server_message(
 
                     let configure = serde_json::json!({
                         "type": "tunnel_configure",
+                        "tunnel_id": tunnel_id,
                         "tunnel_prn": tunnel_prn,
                         "device_public_key": derive_public_key(&prep.private_key).unwrap_or_default(),
                         "device_endpoint_ip": outbound_ip(),
