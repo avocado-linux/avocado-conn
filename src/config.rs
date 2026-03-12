@@ -89,6 +89,10 @@ pub struct MqttConfig {
     pub username: String,
     pub password: String,
     pub client_id: String,
+    /// Explicit TLS toggle from the claim API. When `None`, auto-detect by port
+    /// (8883 → TLS, else plain TCP).
+    #[serde(default)]
+    pub tls: Option<bool>,
 }
 
 fn default_mqtt_host() -> String {

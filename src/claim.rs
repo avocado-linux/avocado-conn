@@ -49,6 +49,8 @@ struct ClaimMqtt {
     username: String,
     password: String,
     client_id: String,
+    /// Server-provided TLS hint. When absent, the daemon auto-detects by port.
+    tls: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -146,6 +148,7 @@ pub async fn claim(config: &AgentConfig) -> Result<ClaimedState> {
                 username: body.data.mqtt.username,
                 password: body.data.mqtt.password,
                 client_id: body.data.mqtt.client_id,
+                tls: body.data.mqtt.tls,
             },
             tuf_url: body.data.tuf_url,
             artifacts_url: body.data.artifacts_url,

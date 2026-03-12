@@ -79,6 +79,21 @@ pub async fn connect_and_run(
         false,
     ));
 
+    // TLS: explicit from claim response, or auto-detect by port (8883 = TLS).
+    let use_tls = cfg.tls.unwrap_or(cfg.port == 8883);
+    if use_tls {
+        use rumqttc::tokio_rustls::rustls;
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        options.set_transport(rumqttc::Transport::tls_with_config(
+            rumqttc::TlsConfiguration::Rustls(Arc::new(tls_config)),
+        ));
+        info!("MQTT TLS enabled");
+    }
+
     let (client, mut eventloop) = AsyncClient::new(options, 64);
 
     // Poll the eventloop in a background task — rumqttc requires continuous polling
@@ -98,7 +113,7 @@ pub async fn connect_and_run(
         }
     });
 
-    info!(host = %cfg.host, port = cfg.port, client_id = %cfg.client_id, "connecting to MQTT...");
+    info!(host = %cfg.host, port = cfg.port, tls = use_tls, client_id = %cfg.client_id, "connecting to MQTT...");
 
     let mut pending: HashMap<String, TunnelPrep> = HashMap::new();
 
