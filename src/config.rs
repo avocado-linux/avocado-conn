@@ -73,7 +73,7 @@ pub struct RuntimeConfig {
 }
 
 fn default_api_url() -> String {
-    "http://localhost:3001".to_string()
+    "https://connect.peridio.com".to_string()
 }
 
 fn default_avocadoctl_socket() -> String {
