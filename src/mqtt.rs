@@ -1,6 +1,7 @@
 use anyhow::{Result, bail};
 use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -35,7 +36,7 @@ pub async fn connect_and_run(
     outbox: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
     outbox_tx: &tokio::sync::mpsc::UnboundedSender<String>,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
-    rat_available: bool,
+    rat_available: Arc<AtomicBool>,
     api_url: &str,
     tuf_url: Option<&str>,
     artifacts_url: Option<&str>,
@@ -119,7 +120,7 @@ pub async fn connect_and_run(
                         // Send device shadow: capabilities + config + runtime + tuf reported on every connect.
                         let mut shadow = serde_json::json!({
                             "type": "shadow",
-                            "tunnels": rat_available,
+                            "tunnels": rat_available.load(Ordering::Relaxed),
                             "keepalive_secs": keepalive_secs,
                         });
                         if let Some(rt) = &runtime {
@@ -148,7 +149,7 @@ pub async fn connect_and_run(
                             &mut pending,
                             &tunnel_cfg,
                             &active_tunnels,
-                            rat_available,
+                            &rat_available,
                             api_url,
                             &cfg.password,
                             tuf_url,
@@ -298,7 +299,7 @@ async fn handle_server_message(
     pending: &mut HashMap<String, TunnelPrep>,
     cfg: &TunnelConfig,
     active_tunnels: &ActiveTunnels,
-    rat_available: bool,
+    rat_available: &Arc<AtomicBool>,
     _api_url: &str,
     jwt: &str,
     tuf_url: Option<&str>,
@@ -331,7 +332,7 @@ async fn handle_server_message(
                 let tx = outbox_tx.clone();
                 let runtime_clone = _runtime.clone();
                 let keepalive = keepalive_secs;
-                let rat = rat_available;
+                let rat = rat_available.clone();
                 tokio::spawn(async move {
                     let event = match varlink_add_from_url(&socket, &tuf, &jwt, Some(&artifacts))
                         .await
@@ -343,7 +344,7 @@ async fn handle_server_message(
                             let new_rt = varlink_get_active_runtime(&socket).await;
                             let mut shadow = serde_json::json!({
                                 "type": "shadow",
-                                "tunnels": rat,
+                                "tunnels": rat.load(Ordering::Relaxed),
                                 "keepalive_secs": keepalive,
                             });
                             if let Some(v) = new_rv {
@@ -381,7 +382,7 @@ async fn handle_server_message(
 
     match msg["type"].as_str() {
         Some("tunnel_request") => {
-            if !rat_available {
+            if !rat_available.load(Ordering::Relaxed) {
                 warn!("received tunnel_request but rat is unavailable, sending nack");
                 return vec![
                     serde_json::json!({
@@ -436,7 +437,7 @@ async fn handle_server_message(
         }
 
         Some("tunnel_established") => {
-            if !rat_available {
+            if !rat_available.load(Ordering::Relaxed) {
                 warn!("received tunnel_established but rat is unavailable, ignoring");
                 return vec![];
             }
@@ -492,7 +493,7 @@ async fn handle_server_message(
         }
 
         Some("tunnel_closed") => {
-            if !rat_available {
+            if !rat_available.load(Ordering::Relaxed) {
                 warn!("received tunnel_closed but rat is unavailable, ignoring");
                 return vec![];
             }
@@ -509,7 +510,7 @@ async fn handle_server_message(
         }
 
         Some("tunnel_extended") => {
-            if !rat_available {
+            if !rat_available.load(Ordering::Relaxed) {
                 warn!("received tunnel_extended but rat is unavailable, ignoring");
                 return vec![];
             }

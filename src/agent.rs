@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::time::Duration;
 use tracing::{info, warn};
@@ -22,8 +23,9 @@ pub async fn run(
     runtime: Option<RuntimeConfig>,
     avocadoctl_socket: String,
 ) -> Result<()> {
-    let rat_available = probe_rat(&tunnel_config.rat_socket_path).await;
-    info!(rat_available, "rat probe complete");
+    let initial = probe_rat(&tunnel_config.rat_socket_path).await;
+    let rat_available = Arc::new(AtomicBool::new(initial));
+    info!(rat_available = initial, "rat probe complete");
 
     // Shared active-tunnel map: tunnel_id -> (expiry_unix_secs, tunnel_prn).
     // Created once and shared across all reconnects so the watchdog continues
@@ -50,6 +52,52 @@ pub async fn run(
         });
     }
 
+    // Rat availability watchdog — re-probes the rat socket every 30s and
+    // publishes an updated shadow if the value changes. This handles both
+    // boot races (rat starts after conn) and runtime restarts of rat.
+    {
+        let rat = rat_available.clone();
+        let socket_path = rat_socket_path.clone();
+        let tx = outbox_tx.clone();
+        let keepalive = intervals.keepalive_secs;
+        let avocadoctl = avocadoctl_socket.clone();
+        let rt_cfg = runtime.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                let now_available = probe_rat(&socket_path).await;
+                let was_available = rat.load(Ordering::Relaxed);
+                if now_available != was_available {
+                    info!(
+                        was = was_available,
+                        now = now_available,
+                        "rat availability changed"
+                    );
+                    rat.store(now_available, Ordering::Relaxed);
+                    // Publish updated shadow so the server knows immediately.
+                    let mut shadow = serde_json::json!({
+                        "type": "shadow",
+                        "tunnels": now_available,
+                        "keepalive_secs": keepalive,
+                    });
+                    if let Some(v) = mqtt::varlink_get_root_version(&avocadoctl).await {
+                        shadow["root_version"] = serde_json::json!(v);
+                    }
+                    if let Some(rt) = mqtt::varlink_get_active_runtime(&avocadoctl).await {
+                        shadow["runtime_id"] = serde_json::json!(rt.id);
+                        shadow["runtime_name"] = serde_json::json!(rt.name);
+                        shadow["runtime_version"] = serde_json::json!(rt.version);
+                    } else if let Some(ref rt) = rt_cfg {
+                        shadow["runtime_id"] = serde_json::json!(rt.id);
+                        shadow["runtime_name"] = serde_json::json!(rt.name);
+                        shadow["runtime_version"] = serde_json::json!(rt.version);
+                    }
+                    let _ = tx.send(shadow.to_string());
+                }
+            }
+        });
+    }
+
     // MQTT connect loop with auto-reconnect.
     let mqtt_handle = tokio::spawn({
         let tunnels = active_tunnels.clone();
@@ -65,7 +113,7 @@ pub async fn run(
                     &mut outbox_rx,
                     &outbox_tx_loop,
                     &mut shutdown_rx,
-                    rat_available,
+                    rat_available.clone(),
                     &api_url,
                     tuf_url.as_deref(),
                     artifacts_url.as_deref(),
