@@ -100,73 +100,82 @@ pub async fn claim(config: &AgentConfig) -> Result<ClaimedState> {
     let token = config
         .claim_token
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("no claim_token in config"))?;
+        .ok_or_else(|| anyhow::anyhow!("no claim_token in config"))?
+        .clone();
 
     let source = config
         .device_id_source
         .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("no device_id_source in config"))?;
+        .ok_or_else(|| anyhow::anyhow!("no device_id_source in config"))?
+        .to_string();
 
-    let fingerprint = device_id::resolve_device_id(source)?;
+    let api_url = config.api_url.clone();
+    let metadata_dir = config.metadata_dir.clone();
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()?;
+    // Run the blocking HTTP call on a separate thread so we don't block the
+    // tokio current_thread runtime.
+    tokio::task::spawn_blocking(move || {
+        let fingerprint = device_id::resolve_device_id(&source)?;
 
-    let url = format!("{}/api/device/claim", config.api_url);
-    info!(url = %url, fingerprint = %fingerprint, "attempting device claim");
+        let url = format!("{}/api/device/claim", api_url);
+        info!(url = %url, fingerprint = %fingerprint, "attempting device claim");
 
-    let resp = client
-        .post(&url)
-        .json(&ClaimRequest {
-            token: token.clone(),
-            hardware_fingerprint: fingerprint,
-        })
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("claim request failed: {e}"))?;
+        let config = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(30)))
+            .build();
+        let agent = ureq::Agent::new_with_config(config);
 
-    let status = resp.status();
-    if status.is_success() {
-        let body: ClaimResponse = resp
-            .json()
-            .await
-            .map_err(|e| anyhow::anyhow!("parsing claim response: {e}"))?;
+        let mut resp = agent
+            .post(&url)
+            .send_json(&ClaimRequest {
+                token,
+                hardware_fingerprint: fingerprint,
+            })
+            .map_err(|e| anyhow::anyhow!("claim request failed: {e}"))?;
 
-        // Write root.json to metadata dir if provided (Level 0 TOFU)
-        if let Some(ref root_json) = body.data.root_json
-            && let Err(e) = write_root_json(&config.metadata_dir, root_json)
-        {
-            warn!(error = %e, "failed to write root.json from claim response");
+        let status = resp.status();
+        if status.is_success() {
+            let claim_resp: ClaimResponse = resp
+                .body_mut()
+                .read_json()
+                .map_err(|e| anyhow::anyhow!("parsing claim response: {e}"))?;
+
+            // Write root.json to metadata dir if provided (Level 0 TOFU)
+            if let Some(ref root_json) = claim_resp.data.root_json
+                && let Err(e) = write_root_json(&metadata_dir, root_json)
+            {
+                warn!(error = %e, "failed to write root.json from claim response");
+            }
+
+            let state = ClaimedState {
+                device_id: claim_resp.data.device.id,
+                mqtt: MqttConfig {
+                    host: claim_resp.data.mqtt.host,
+                    port: claim_resp.data.mqtt.port,
+                    username: claim_resp.data.mqtt.username,
+                    password: claim_resp.data.mqtt.password,
+                    client_id: claim_resp.data.mqtt.client_id,
+                    tls: claim_resp.data.mqtt.tls,
+                },
+                tuf_url: claim_resp.data.tuf_url,
+                artifacts_url: claim_resp.data.artifacts_url,
+                claimed_at: chrono::Utc::now().to_rfc3339(),
+            };
+            Ok(state)
+        } else {
+            let err_body: ClaimErrorBody = resp.body_mut().read_json().unwrap_or(ClaimErrorBody {
+                error: format!("http_{}", status),
+                message: "unknown error".to_string(),
+            });
+            bail!(
+                "claim failed ({}): {} — {}",
+                status,
+                err_body.error,
+                err_body.message
+            )
         }
-
-        let state = ClaimedState {
-            device_id: body.data.device.id,
-            mqtt: MqttConfig {
-                host: body.data.mqtt.host,
-                port: body.data.mqtt.port,
-                username: body.data.mqtt.username,
-                password: body.data.mqtt.password,
-                client_id: body.data.mqtt.client_id,
-                tls: body.data.mqtt.tls,
-            },
-            tuf_url: body.data.tuf_url,
-            artifacts_url: body.data.artifacts_url,
-            claimed_at: chrono::Utc::now().to_rfc3339(),
-        };
-        Ok(state)
-    } else {
-        let err_body: ClaimErrorBody = resp.json().await.unwrap_or(ClaimErrorBody {
-            error: format!("http_{}", status.as_u16()),
-            message: "unknown error".to_string(),
-        });
-        bail!(
-            "claim failed ({}): {} — {}",
-            status,
-            err_body.error,
-            err_body.message
-        )
-    }
+    })
+    .await?
 }
 
 // ---------------------------------------------------------------------------

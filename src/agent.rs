@@ -34,7 +34,7 @@ pub async fn run(
 
     // Channel for the expiry watchdog to queue outbound MQTT messages
     // (e.g. tunnel_close notifications) to be sent by the MQTT loop.
-    let (outbox_tx, mut outbox_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (outbox_tx, mut outbox_rx) = tokio::sync::mpsc::channel::<String>(64);
 
     // Shutdown signal: agent sends `true` after closing all tunnels, MQTT loop
     // drains remaining outbox messages and exits cleanly.
@@ -92,7 +92,7 @@ pub async fn run(
                         shadow["runtime_name"] = serde_json::json!(rt.name);
                         shadow["runtime_version"] = serde_json::json!(rt.version);
                     }
-                    let _ = tx.send(shadow.to_string());
+                    let _ = tx.try_send(shadow.to_string());
                 }
             }
         });

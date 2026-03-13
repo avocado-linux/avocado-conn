@@ -25,6 +25,7 @@ struct TunnelPrep {
     iface_name: String,
     expires_at: String,
     tunnel_prn: String,
+    created: std::time::Instant,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -33,8 +34,8 @@ pub async fn connect_and_run(
     keepalive_secs: u64,
     tunnel_cfg: TunnelConfig,
     active_tunnels: ActiveTunnels,
-    outbox: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
-    outbox_tx: &tokio::sync::mpsc::UnboundedSender<String>,
+    outbox: &mut tokio::sync::mpsc::Receiver<String>,
+    outbox_tx: &tokio::sync::mpsc::Sender<String>,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
     rat_available: Arc<AtomicBool>,
     api_url: &str,
@@ -116,9 +117,19 @@ pub async fn connect_and_run(
     info!(host = %cfg.host, port = cfg.port, tls = use_tls, client_id = %cfg.client_id, "connecting to MQTT...");
 
     let mut pending: HashMap<String, TunnelPrep> = HashMap::new();
+    let mut pending_cleanup = tokio::time::interval(std::time::Duration::from_secs(60));
 
     loop {
         tokio::select! {
+            // Evict pending tunnels that never received tunnel_established.
+            _ = pending_cleanup.tick() => {
+                let before = pending.len();
+                pending.retain(|_, prep| prep.created.elapsed().as_secs() < 60);
+                let evicted = before - pending.len();
+                if evicted > 0 {
+                    warn!(evicted, "evicted stale pending tunnels");
+                }
+            }
             result = evt_rx.recv() => {
                 match result {
                     None => {
@@ -237,7 +248,7 @@ pub async fn connect_and_run(
 pub async fn shutdown_tunnels(
     active_tunnels: &ActiveTunnels,
     rat_socket_path: &str,
-    outbox: &tokio::sync::mpsc::UnboundedSender<String>,
+    outbox: &tokio::sync::mpsc::Sender<String>,
 ) {
     // Drain the map atomically so the watchdog won't also try to close these.
     let tunnels: Vec<(String, String)> = {
@@ -254,7 +265,7 @@ pub async fn shutdown_tunnels(
         }
         // Queue server notification — MQTT loop drains these before closing.
         let msg = serde_json::json!({"type": "tunnel_close", "tunnel_prn": tunnel_prn}).to_string();
-        let _ = outbox.send(msg);
+        let _ = outbox.try_send(msg);
     }
 }
 
@@ -266,7 +277,7 @@ pub async fn shutdown_tunnels(
 pub async fn expiry_watchdog(
     active_tunnels: ActiveTunnels,
     rat_socket_path: String,
-    outbox: tokio::sync::mpsc::UnboundedSender<String>,
+    outbox: tokio::sync::mpsc::Sender<String>,
 ) {
     loop {
         tokio::time::sleep(Duration::from_secs(30)).await;
@@ -297,7 +308,7 @@ pub async fn expiry_watchdog(
             }
             let msg =
                 serde_json::json!({"type": "tunnel_close", "tunnel_prn": tunnel_prn}).to_string();
-            if outbox.send(msg).is_err() {
+            if outbox.try_send(msg).is_err() {
                 warn!(
                     tunnel_id,
                     "expiry watchdog: outbox closed, server notification dropped"
@@ -321,7 +332,7 @@ async fn handle_server_message(
     artifacts_url: Option<&str>,
     _runtime: &Option<RuntimeConfig>,
     avocadoctl_socket: &str,
-    outbox_tx: &tokio::sync::mpsc::UnboundedSender<String>,
+    outbox_tx: &tokio::sync::mpsc::Sender<String>,
     keepalive_secs: u64,
 ) -> Vec<String> {
     let msg: serde_json::Value = match serde_json::from_str(text) {
@@ -376,7 +387,7 @@ async fn handle_server_message(
                                 shadow["runtime_name"] = serde_json::json!(rt.name);
                                 shadow["runtime_version"] = serde_json::json!(rt.version);
                             }
-                            let _ = tx.send(shadow.to_string());
+                            let _ = tx.try_send(shadow.to_string());
                             serde_json::json!({"type": "update_result", "success": true})
                         }
                         Err(e) => {
@@ -384,7 +395,7 @@ async fn handle_server_message(
                             serde_json::json!({"type": "update_result", "success": false, "error": e.to_string()})
                         }
                     };
-                    let _ = tx.send(event.to_string());
+                    let _ = tx.try_send(event.to_string());
                 });
             }
             _ => warn!(
@@ -583,7 +594,7 @@ pub async fn varlink_get_root_version(socket_addr: &str) -> Option<u64> {
     let _ = stream.shutdown().await;
 
     let mut buf = Vec::new();
-    if stream.read_to_end(&mut buf).await.is_err() {
+    if stream.take(64 * 1024).read_to_end(&mut buf).await.is_err() {
         return None;
     }
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
@@ -625,7 +636,7 @@ pub async fn varlink_get_active_runtime(socket_addr: &str) -> Option<RuntimeConf
     let _ = stream.shutdown().await;
 
     let mut buf = Vec::new();
-    if stream.read_to_end(&mut buf).await.is_err() {
+    if stream.take(64 * 1024).read_to_end(&mut buf).await.is_err() {
         return None;
     }
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
@@ -688,7 +699,7 @@ async fn varlink_add_from_url(
 
     // Read response (NUL-terminated)
     let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await?;
+    stream.take(64 * 1024).read_to_end(&mut buf).await?;
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     let resp: serde_json::Value = serde_json::from_slice(&buf[..end])
         .map_err(|e| anyhow::anyhow!("invalid varlink response: {e}"))?;
@@ -755,6 +766,7 @@ async fn prepare_tunnel(tunnel_id: &str, cfg: &TunnelConfig) -> Result<TunnelPre
         iface_name,
         expires_at: String::new(),
         tunnel_prn: String::new(),
+        created: std::time::Instant::now(),
     })
 }
 
