@@ -98,11 +98,16 @@ pub async fn run(
         });
     }
 
+    // Shared update task handle — persists across MQTT reconnects so a reconnect
+    // mid-update does not spawn a second concurrent update task.
+    let update_task: mqtt::UpdateTask = Arc::new(Mutex::new(None));
+
     // MQTT connect loop with auto-reconnect.
     let mqtt_handle = tokio::spawn({
         let tunnels = active_tunnels.clone();
         let mut shutdown_rx = shutdown_rx;
         let outbox_tx_loop = outbox_tx.clone();
+        let update_task = update_task.clone();
         async move {
             loop {
                 match mqtt::connect_and_run(
@@ -119,6 +124,7 @@ pub async fn run(
                     artifacts_url.as_deref(),
                     runtime.clone(),
                     &avocadoctl_socket,
+                    &update_task,
                 )
                 .await
                 {
