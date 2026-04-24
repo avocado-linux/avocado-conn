@@ -1,0 +1,29 @@
+# cargo-audit configuration.
+#
+# Ignored advisories are tracked against upstream fixes. Each entry documents
+# why we are not practically exposed and what would close the ignore.
+
+[advisories]
+ignore = [
+    # rustls-webpki 0.102.x (unmaintained branch) — pulled transitively by
+    # rumqttc 0.25 via rustls-native-certs. All four advisories concern
+    # CRL parsing and name-constraint handling of server certificates.
+    # avocado-conn only performs outbound TLS to the configured MQTT broker
+    # and platform API; it does not consume attacker-controlled CRLs. Closes
+    # when rumqttc bumps its rustls-webpki dep to 0.103.x (tracked separately).
+    "RUSTSEC-2026-0049", # CRLs not authoritative by DP due to faulty matching
+    "RUSTSEC-2026-0098", # Name constraints for URI names incorrectly accepted
+    "RUSTSEC-2026-0099", # Name constraints accepted for wildcard cert names
+    "RUSTSEC-2026-0104", # Reachable panic in CRL parsing
+
+    # rustls-pemfile 2.2.0 — unmaintained notice. Functionality has moved to
+    # rustls-pki-types. Transitive via rumqttc 0.25. No runtime impact;
+    # closes when rumqttc migrates.
+    "RUSTSEC-2025-0134",
+
+    # rand unsoundness — affects code that calls `rand::rng()` from inside a
+    # custom global logger. avocado-conn uses tracing (not a custom logger)
+    # and only calls `rand::thread_rng()` from claim::jittered_backoff for
+    # retry jitter. No exposure.
+    "RUSTSEC-2026-0097",
+]
