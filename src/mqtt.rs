@@ -42,6 +42,7 @@ pub async fn connect_and_run(
     artifacts_url: Option<&str>,
     runtime: Option<RuntimeConfig>,
     avocadoctl_socket: &str,
+    update_task: &UpdateTask,
 ) -> Result<()> {
     // Read root version from avocadoctl (best-effort, don't fail if unavailable)
     let root_version = varlink_get_root_version(avocadoctl_socket).await;
@@ -173,6 +174,7 @@ pub async fn connect_and_run(
                             avocadoctl_socket,
                             outbox_tx,
                             keepalive_secs,
+                            update_task,
                         )
                         .await;
                         for reply in replies {
@@ -308,6 +310,19 @@ pub async fn expiry_watchdog(
     }
 }
 
+/// Handle to a running update task. Shared across MQTT reconnects so that a
+/// reconnect mid-update does not spawn a second concurrent update.
+pub type UpdateTask = Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>;
+
+/// Returns true if an update task is currently running (handle present and not finished).
+fn update_in_progress(task: &UpdateTask) -> bool {
+    task.lock()
+        .unwrap()
+        .as_ref()
+        .map(|h| !h.is_finished())
+        .unwrap_or(false)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_server_message(
     text: &str,
@@ -323,6 +338,7 @@ async fn handle_server_message(
     avocadoctl_socket: &str,
     outbox_tx: &tokio::sync::mpsc::UnboundedSender<String>,
     keepalive_secs: u64,
+    update_task: &UpdateTask,
 ) -> Vec<String> {
     let msg: serde_json::Value = match serde_json::from_str(text) {
         Ok(m) => m,
@@ -340,6 +356,10 @@ async fn handle_server_message(
                     artifacts_url = artifacts,
                     "runtime update available — calling avocadoctl via varlink"
                 );
+                if update_in_progress(update_task) {
+                    warn!("runtime update already in progress, ignoring duplicate type=0 message");
+                    return vec![];
+                }
                 let tuf = tuf.to_string();
                 let artifacts = artifacts.to_string();
                 let jwt = jwt.to_string();
@@ -348,7 +368,7 @@ async fn handle_server_message(
                 let runtime_clone = _runtime.clone();
                 let keepalive = keepalive_secs;
                 let rat = rat_available.clone();
-                tokio::spawn(async move {
+                *update_task.lock().unwrap() = Some(tokio::spawn(async move {
                     let event = match varlink_add_from_url(&socket, &tuf, &jwt, Some(&artifacts))
                         .await
                     {
@@ -385,7 +405,7 @@ async fn handle_server_message(
                         }
                     };
                     let _ = tx.send(event.to_string());
-                });
+                }));
             }
             _ => warn!(
                 "runtime update available but tuf_url/artifacts_url not set in config; \
@@ -881,5 +901,32 @@ mod tests {
             .to_rfc3339();
         let secs = remaining_ttl_secs(&ts_str);
         assert!(secs > 7190 && secs <= 7200, "expected ~7200, got {secs}");
+    }
+
+    #[tokio::test]
+    async fn update_in_progress_returns_false_when_empty() {
+        let task: UpdateTask = Arc::new(Mutex::new(None));
+        assert!(!update_in_progress(&task));
+    }
+
+    #[tokio::test]
+    async fn update_in_progress_returns_true_when_running() {
+        let task: UpdateTask = Arc::new(Mutex::new(None));
+        let handle =
+            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
+        *task.lock().unwrap() = Some(handle);
+        assert!(update_in_progress(&task));
+    }
+
+    #[tokio::test]
+    async fn update_in_progress_returns_false_when_finished() {
+        let task: UpdateTask = Arc::new(Mutex::new(None));
+        let handle = tokio::spawn(async {});
+        handle.await.unwrap();
+        // Spawn a new (finished) handle and store it
+        let handle = tokio::spawn(async {});
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        *task.lock().unwrap() = Some(handle);
+        assert!(!update_in_progress(&task));
     }
 }

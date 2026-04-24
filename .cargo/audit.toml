@@ -1,0 +1,9 @@
+[advisories]
+ignore = [
+    # rustls-webpki 0.102.x is pulled in transitively by rumqttc, which hard-pins
+    # this version. The 0.102.x and 0.103.x series are semver-incompatible so a
+    # lockfile bump alone cannot resolve it. Blocked on upstream rumqttc releasing
+    # a version that moves to rustls-webpki 0.103.10+.
+    # https://rustsec.org/advisories/RUSTSEC-2026-0049
+    "RUSTSEC-2026-0049",
+]
