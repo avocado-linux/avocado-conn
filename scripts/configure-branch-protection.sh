@@ -2,6 +2,12 @@
 # Configures branch protection for the main branch via a single GitHub Ruleset.
 # Idempotent — safe to re-run if settings drift.
 # Requires: gh CLI (authenticated with repo admin permissions) and jq.
+#
+# Manual pre-steps (run once before the first time):
+#   1. Remove classic branch protection (if present):
+#      gh api -X DELETE repos/avocado-linux/avocado-conn/branches/main/protection
+#   2. Remove the auto-created Copilot ruleset (if present):
+#      gh api -X DELETE repos/avocado-linux/avocado-conn/rulesets/15509730
 set -euo pipefail
 
 REPO="avocado-linux/avocado-conn"
