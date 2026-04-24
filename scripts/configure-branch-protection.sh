@@ -1,46 +1,90 @@
 #!/usr/bin/env bash
-# Configures branch protection rules for the main branch.
+# Configures branch protection for the main branch via a single GitHub Ruleset.
 # Idempotent — safe to re-run if settings drift.
 # Requires: gh CLI authenticated with repo admin permissions.
 set -euo pipefail
 
 REPO="avocado-linux/avocado-conn"
 BRANCH="main"
+RULESET_NAME="main branch protection"
 
 echo "Configuring branch protection for ${REPO}@${BRANCH}..."
 
-gh api "repos/${REPO}/branches/${BRANCH}/protection" \
-  --method PUT \
-  --input - <<'EOF'
-{
-  "required_status_checks": {
-    "strict": true,
-    "checks": [
-      {"context": "Run Tests / Test Suite (stable)"}
-    ]
-  },
-  "enforce_admins": true,
-  "required_pull_request_reviews": {
-    "dismiss_stale_reviews": true,
-    "require_code_owner_reviews": false,
-    "require_last_push_approval": true,
-    "required_approving_review_count": 1
-  },
-  "required_conversation_resolution": true,
-  "restrictions": null,
-  "allow_force_pushes": false,
-  "allow_deletions": false,
-  "required_linear_history": false
-}
-EOF
+# Remove classic branch protection if present
+if gh api "repos/${REPO}/branches/${BRANCH}/protection" >/dev/null 2>&1; then
+  echo "  Removing classic branch protection..."
+  gh api "repos/${REPO}/branches/${BRANCH}/protection" --method DELETE >/dev/null
+fi
 
-echo "Branch protection configured successfully."
+# Fetch all rulesets once
+RULESETS=$(gh api "repos/${REPO}/rulesets")
+
+# Remove auto-created Copilot ruleset if it exists as a separate entry
+COPILOT_ID=$(echo "$RULESETS" | jq -r '.[] | select(.name == "Copilot review for default branch") | .id // empty')
+if [[ -n "$COPILOT_ID" ]]; then
+  echo "  Removing auto-created Copilot ruleset (id: ${COPILOT_ID})..."
+  gh api "repos/${REPO}/rulesets/${COPILOT_ID}" --method DELETE >/dev/null
+fi
+
+# Create or update our consolidated ruleset
+EXISTING_ID=$(echo "$RULESETS" | jq -r --arg n "$RULESET_NAME" '.[] | select(.name == $n) | .id // empty')
+
+if [[ -n "$EXISTING_ID" ]]; then
+  echo "  Updating existing ruleset (id: ${EXISTING_ID})..."
+  METHOD="PUT"
+  ENDPOINT="repos/${REPO}/rulesets/${EXISTING_ID}"
+else
+  echo "  Creating new ruleset..."
+  METHOD="POST"
+  ENDPOINT="repos/${REPO}/rulesets"
+fi
+
+gh api "$ENDPOINT" --method "$METHOD" --input - <<'PAYLOAD'
+{
+  "name": "main branch protection",
+  "target": "branch",
+  "enforcement": "active",
+  "conditions": {
+    "ref_name": {
+      "include": ["~DEFAULT_BRANCH"],
+      "exclude": []
+    }
+  },
+  "rules": [
+    {"type": "deletion"},
+    {"type": "non_fast_forward"},
+    {
+      "type": "required_status_checks",
+      "parameters": {
+        "strict_required_status_checks_policy": true,
+        "required_status_checks": [
+          {"context": "Run Tests / Test Suite (stable)"}
+        ]
+      }
+    },
+    {
+      "type": "pull_request",
+      "parameters": {
+        "required_approving_review_count": 1,
+        "dismiss_stale_reviews_on_push": true,
+        "require_code_owner_review": false,
+        "require_last_push_approval": true,
+        "required_review_thread_resolution": true
+      }
+    },
+    {
+      "type": "copilot_code_review",
+      "parameters": {
+        "review_on_push": false,
+        "review_draft_pull_requests": false
+      }
+    }
+  ],
+  "bypass_actors": []
+}
+PAYLOAD
+
+echo "Branch protection ruleset configured successfully."
 echo ""
 echo "Verify with:"
-echo "  gh api repos/${REPO}/branches/${BRANCH}/protection | jq '{"
-echo "    checks: [.required_status_checks.checks[].context],"
-echo "    strict: .required_status_checks.strict,"
-echo "    enforce_admins: .enforce_admins.enabled,"
-echo "    reviews: .required_pull_request_reviews | {dismiss_stale_reviews,require_code_owner_reviews,require_last_push_approval,required_approving_review_count},"
-echo "    conversation_resolution: .required_conversation_resolution.enabled"
-echo "  }'"
+echo "  gh api repos/${REPO}/rulesets | jq '.[] | select(.name == \"${RULESET_NAME}\") | {id,name,enforcement}'"
