@@ -10,23 +10,8 @@ RULESET_NAME="main branch protection"
 
 echo "Configuring branch protection for ${REPO}@${BRANCH}..."
 
-# Remove classic branch protection if present
-if gh api "repos/${REPO}/branches/${BRANCH}/protection" >/dev/null 2>&1; then
-  echo "  Removing classic branch protection..."
-  gh api "repos/${REPO}/branches/${BRANCH}/protection" --method DELETE >/dev/null
-fi
-
-# Fetch all rulesets once
-RULESETS=$(gh api "repos/${REPO}/rulesets")
-
-# Remove auto-created Copilot ruleset if it exists as a separate entry
-COPILOT_ID=$(echo "$RULESETS" | jq -r '.[] | select(.name == "Copilot review for default branch") | .id // empty')
-if [[ -n "$COPILOT_ID" ]]; then
-  echo "  Removing auto-created Copilot ruleset (id: ${COPILOT_ID})..."
-  gh api "repos/${REPO}/rulesets/${COPILOT_ID}" --method DELETE >/dev/null
-fi
-
 # Create or update our consolidated ruleset
+RULESETS=$(gh api "repos/${REPO}/rulesets")
 EXISTING_ID=$(echo "$RULESETS" | jq -r --arg n "$RULESET_NAME" '.[] | select(.name == $n) | .id // empty')
 
 if [[ -n "$EXISTING_ID" ]]; then
