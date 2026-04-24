@@ -1,4 +1,5 @@
 .avocado-state/
 .avocado/
 target/
-.cargo
+.cargo/*
+!.cargo/audit.toml
