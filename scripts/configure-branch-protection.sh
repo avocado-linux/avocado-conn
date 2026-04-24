@@ -75,7 +75,7 @@ gh api "$ENDPOINT" --method "$METHOD" --input - <<'PAYLOAD'
     {
       "type": "copilot_code_review",
       "parameters": {
-        "review_on_push": false,
+        "review_on_push": true,
         "review_draft_pull_requests": false
       }
     }
