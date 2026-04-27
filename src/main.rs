@@ -65,17 +65,33 @@ async fn run_daemon(config: AgentConfig) -> Result<()> {
 
         // Run the claim loop as a background task that is cancellable via
         // SIGTERM/SIGINT so systemd can stop the service cleanly.
-        let state = tokio::select! {
-            result = claim::claim_with_retry(&config) => result?,
+        let result = tokio::select! {
+            result = claim::claim_with_retry(&config) => result,
             _ = shutdown_signal() => {
                 info!("shutdown received during claim flow");
                 return Ok(());
             }
         };
 
-        config.save_claimed_state(&state)?;
-        info!(device_id = %state.device_id, "claim successful, credentials saved");
-        (state.mqtt, state.tuf_url, state.artifacts_url)
+        match result {
+            Ok(state) => {
+                config.save_claimed_state(&state)?;
+                info!(device_id = %state.device_id, "claim successful, credentials saved");
+                (state.mqtt, state.tuf_url, state.artifacts_url)
+            }
+            Err(_) => {
+                // 409 identifier_taken, invalid/expired token, malformed
+                // request, etc. Retrying cannot recover — stay alive and idle
+                // until operator intervention (config fix, stale device
+                // record cleanup, new token) triggers a process restart.
+                // Crash-looping here would mean systemd immediately
+                // re-hammering /api/device/claim (ENG-1822). The error
+                // itself is logged in claim_with_retry with attempt context.
+                info!("claim rejected as terminal; idling until restart");
+                shutdown_signal().await;
+                return Ok(());
+            }
+        }
     } else {
         let mqtt_cfg = config.resolve_mqtt()?;
         (
