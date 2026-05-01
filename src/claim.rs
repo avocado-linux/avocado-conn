@@ -152,10 +152,13 @@ fn jittered_backoff(attempt: u32) -> Duration {
 ///
 /// - `429 Too Many Requests` → Transient (honors `Retry-After`)
 /// - `5xx` / 3xx / 1xx → Transient
+/// - `409 reclaim_pending` → Transient (honors `Retry-After`). Server-side
+///   workflow that completes only after admin approval; the same fingerprint
+///   will eventually succeed without device-side input changes.
 /// - Any other 4xx → Permanent. A well-formed request that returns 400/401/
 ///   403/404/409/422 will keep returning the same error on retry. This
-///   prevents the 409 `identifier_taken` retry storm (ENG-1822) and every
-///   analogous case for future 4xx codes.
+///   prevents the 409 `identifier_taken` retry storm and every analogous case
+///   for future 4xx codes.
 fn classify(
     status: StatusCode,
     code: String,
@@ -163,6 +166,17 @@ fn classify(
     retry_after: Option<Duration>,
 ) -> AttemptError {
     if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+        return AttemptError::Transient {
+            code,
+            message,
+            retry_after,
+        };
+    }
+    // Carve-out: server-side workflows that explicitly tell us to retry. The
+    // whitelist is intentional — keeps unknown 4xx codes defaulting to
+    // permanent. Add new (status, code) pairs here only when the server
+    // contract guarantees the request will eventually succeed unchanged.
+    if status == StatusCode::CONFLICT && code == "reclaim_pending" {
         return AttemptError::Transient {
             code,
             message,
@@ -418,6 +432,77 @@ mod tests {
             classify_status(503),
             AttemptError::Transient { .. }
         ));
+    }
+
+    #[test]
+    fn classify_409_reclaim_pending_is_transient() {
+        let err = classify(
+            StatusCode::CONFLICT,
+            "reclaim_pending".into(),
+            "msg".into(),
+            None,
+        );
+        assert!(matches!(err, AttemptError::Transient { .. }));
+    }
+
+    #[test]
+    fn classify_409_reclaim_pending_propagates_retry_after() {
+        let err = classify(
+            StatusCode::CONFLICT,
+            "reclaim_pending".into(),
+            "msg".into(),
+            Some(Duration::from_secs(30)),
+        );
+        match err {
+            AttemptError::Transient { retry_after, .. } => {
+                assert_eq!(retry_after, Some(Duration::from_secs(30)));
+            }
+            _ => panic!("expected Transient"),
+        }
+    }
+
+    #[test]
+    fn classify_403_reclaim_denied_is_permanent() {
+        let err = classify(
+            StatusCode::FORBIDDEN,
+            "reclaim_denied".into(),
+            "msg".into(),
+            None,
+        );
+        assert!(matches!(err, AttemptError::Permanent(_)));
+    }
+
+    #[test]
+    fn classify_409_unknown_code_is_permanent() {
+        // Regression guard for the 4xx storm fix — only the explicit
+        // `reclaim_pending` whitelist should be transient at 4xx.
+        let err = classify(
+            StatusCode::CONFLICT,
+            "some_other_409".into(),
+            "msg".into(),
+            None,
+        );
+        assert!(matches!(err, AttemptError::Permanent(_)));
+    }
+
+    #[test]
+    fn classify_reclaim_pending_with_non_409_status_is_permanent() {
+        // The carve-out is keyed on (status == 409, code == "reclaim_pending").
+        // A `reclaim_pending` body sent under any other status (mis-coded by a
+        // future server) must NOT be treated as transient — the whitelist is
+        // by status+code, not by code alone.
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ] {
+            let err = classify(status, "reclaim_pending".into(), "msg".into(), None);
+            assert!(
+                matches!(err, AttemptError::Permanent(_)),
+                "expected Permanent for status {status}"
+            );
+        }
     }
 
     #[test]
