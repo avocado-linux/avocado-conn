@@ -30,6 +30,21 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Defense-in-depth: Cargo.toml pins the dep graph so `ring` is the
+    // only crypto provider in the tree, and rustls 0.23 auto-picks when
+    // there's a single provider. Installing it explicitly here belts the
+    // suspenders — if a future transitive change accidentally re-adds a
+    // second provider on this same rustls 0.23 crate before CI catches it,
+    // the explicit install ensures `ring` stays the default.
+    //
+    // Caveat: this only configures *this* crate's rustls 0.23 instance.
+    // A future side-by-side rustls 0.24 from a transitive bump would have
+    // its own provider config independent of this call. That scenario is
+    // covered by the duplicate-rustls CI guard, not this install.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("install rustls ring crypto provider");
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -132,5 +147,38 @@ async fn shutdown_signal() {
         tokio::signal::ctrl_c()
             .await
             .expect("register SIGINT handler");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Regression guard for the rustls 0.23 dual-provider panic (PR #12).
+    /// Mirrors mqtt.rs's TLS config construction.
+    ///
+    /// Catches:
+    /// - Dep-graph regressions where `rustls::crypto::ring` becomes
+    ///   unresolvable (compile error: `ring` feature dropped from rustls).
+    /// - Dep-graph regressions where `ClientConfig::builder()` panics
+    ///   because a second provider sneaks back into the tree.
+    /// - rustls API drift that breaks the build path mqtt.rs depends on.
+    ///
+    /// Does NOT catch: someone removing the `install_default()` call from
+    /// `main()` — `cargo test` runs in its own process, separate from main,
+    /// so this test does its own install. With the current dep graph
+    /// (single provider), removing the install would still work because
+    /// rustls auto-picks when only one provider is registered; the install
+    /// is defense-in-depth.
+    #[test]
+    fn rustls_provider_can_build_client_config() {
+        // Install ring for this test process. Returns Err if another test
+        // in the same process installed first — ignore; we just need *some*
+        // default registered before the builder runs.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let _ = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
     }
 }

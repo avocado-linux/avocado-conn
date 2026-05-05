@@ -46,5 +46,38 @@ jobs:
       - name: Build
         run: cargo build --verbose
 
+      - name: Verify rustls dep-tree shape
+        # Two regression guards for the rustls 0.23 dual-provider panic
+        # fixed in PR #12. The behavioral regression (rustls API drift
+        # breaks ClientConfig construction) is covered by the
+        # rustls_provider_can_build_client_config test in src/main.rs.
+        run: |
+          set -euo pipefail
+
+          # 1. aws-lc-rs must not be in the dep tree.
+          #    rumqttc is configured with use-rustls-no-provider precisely
+          #    to keep aws-lc-rs out. The explicit install_default() in
+          #    main() would still hide this at runtime by selecting ring,
+          #    so reintroducing aws-lc-rs wouldn't immediately re-trigger
+          #    the panic — but it would regress the intended single-
+          #    provider dep graph (binary size, build complexity, removal
+          #    of cmake/C-toolchain dependency) and weaken the layered
+          #    protection model. Fail CI to keep the dep graph clean.
+          if cargo tree -i aws-lc-rs 2>/dev/null | grep -q '^aws-lc-rs'; then
+            echo "::error::aws-lc-rs is back in the dep tree. The intended single-provider shape regressed — some feature change pulled it in. Runtime is still protected by main()'s install_default(), but the dep graph should stay aws-lc-rs-free (binary size + cross-compile simplicity)."
+            cargo tree -i aws-lc-rs
+            exit 1
+          fi
+
+          # 2. Only one rustls major in the tree.
+          #    If a future bump introduces side-by-side rustls 0.24, that
+          #    new copy has its own crypto provider config independent of
+          #    ours — and could re-introduce the dual-provider scenario.
+          if cargo tree -d 2>&1 | grep -q '^rustls v'; then
+            echo "::error::Multiple rustls versions in dep tree. Each major needs its own provider config; consolidate by pinning direct deps."
+            cargo tree -d
+            exit 1
+          fi
+
       - name: Run tests
         run: cargo test --verbose
