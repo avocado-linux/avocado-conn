@@ -17,9 +17,21 @@ id-nic-mac = []
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-rumqttc = { version = "0.25", features = ["use-rustls"] }
+# Use rumqttc's `use-rustls-no-provider` feature instead of `use-rustls`.
+# `use-rustls` activates `tokio-rustls/default`, which transitively pulls
+# `aws-lc-rs` onto the same rustls 0.23 crate that reqwest uses with
+# `ring` — and rustls 0.23 refuses to auto-pick when more than one
+# crypto provider is registered. By using the no-provider feature we let
+# reqwest's rustls-tls (which activates tokio-rustls/ring) be the sole
+# provider source, keeping `ring` as the only provider in the tree.
+rumqttc = { version = "0.25", default-features = false, features = ["use-rustls-no-provider"] }
 webpki-roots = "1"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+# Direct rustls dep so main.rs can call `rustls::crypto::ring::default_provider()`
+# as defense-in-depth init. The provider feature is also activated transitively
+# via reqwest → tokio-rustls/ring → rustls/ring; pinning here makes the path
+# explicit at our crate's vertex of the dep graph.
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
