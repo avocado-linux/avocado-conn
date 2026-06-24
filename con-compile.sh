@@ -50,6 +50,10 @@ EOF
 # Use a persistent cargo registry cache to avoid re-downloading crates
 export CARGO_HOME="${AVOCADO_BUILD_DIR}/.cargo-cache"
 
-cargo build --release --target "$RUST_TARGET" --target-dir "$AVOCADO_BUILD_DIR"
+# --locked: in a published (remote) extension the compile runs from the staged
+# package_files; fail loudly if Cargo.lock is missing/stale rather than silently
+# re-resolving (which could drop pinned security fixes), instead of trusting an
+# implicit re-resolve.
+cargo build --locked --release --target "$RUST_TARGET" --target-dir "$AVOCADO_BUILD_DIR"
 
 echo "avocado-conn compiled successfully"
