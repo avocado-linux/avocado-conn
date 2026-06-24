@@ -1,4 +1,4 @@
-.avocado-state/
+.avocado-state
 .avocado/
 target/
 .cargo/*
