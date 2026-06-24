@@ -1,6 +1,14 @@
 #!/bin/bash
 set -e
 
+# These are provided by the SDK environment when run via `avocado ext build`.
+# Guard up front so a stray invocation can't glob /*.json or write to unexpected
+# paths instead of failing clearly.
+: "${RUST_TARGET_PATH:?must be set (run via 'avocado ext build')}"
+: "${OECORE_TARGET_ARCH:?must be set (run via 'avocado ext build')}"
+: "${SDKTARGETSYSROOT:?must be set (run via 'avocado ext build')}"
+: "${AVOCADO_BUILD_DIR:?must be set (run via 'avocado ext build')}"
+
 # Find the Rust target from RUST_TARGET_PATH
 for json_file in "$RUST_TARGET_PATH"/*.json; do
     if [ -f "$json_file" ]; then
@@ -24,7 +32,7 @@ cd "$(dirname "$0")"
 # Clear any rustflags that might cause conflicts with our .cargo/config.toml
 unset RUSTFLAGS
 unset CARGO_BUILD_RUSTFLAGS
-for var in $(env | grep -o 'CARGO_TARGET_[A-Z0-9_]*_RUSTFLAGS'); do
+for var in $(env | grep -o 'CARGO_TARGET_[A-Z0-9_]*_RUSTFLAGS' || true); do
     unset "$var"
 done
 

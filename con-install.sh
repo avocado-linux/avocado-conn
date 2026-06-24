@@ -1,6 +1,13 @@
 #!/bin/bash
 set -e
 
+# Provided by the SDK environment when run via `avocado ext build`. Guard so an
+# unset AVOCADO_BUILD_EXT_SYSROOT can't install to /usr/bin on the build host.
+: "${RUST_TARGET_PATH:?must be set (run via 'avocado ext build')}"
+: "${OECORE_TARGET_ARCH:?must be set (run via 'avocado ext build')}"
+: "${AVOCADO_BUILD_DIR:?must be set (run via 'avocado ext build')}"
+: "${AVOCADO_BUILD_EXT_SYSROOT:?must be set (run via 'avocado ext build')}"
+
 # Find the Rust target from RUST_TARGET_PATH
 for json_file in "$RUST_TARGET_PATH"/*.json; do
     if [ -f "$json_file" ]; then
