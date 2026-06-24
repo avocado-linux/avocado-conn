@@ -9,7 +9,9 @@
 # 2. Manual provisioning: Omit claim_token and provide static MQTT
 #    credentials in the [mqtt] section below.
 
-# Persistent storage for credentials after claim (required)
+# Persistent storage for claimed credentials. Required for self-provisioning
+# (option 1); optional for manual provisioning (option 2), which reads static
+# credentials from the [mqtt] section below.
 data_dir = "/var/lib/avocado/connect"
 
 # Connect API endpoint

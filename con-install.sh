@@ -12,6 +12,11 @@ for json_file in "$RUST_TARGET_PATH"/*.json; do
     fi
 done
 
+if [ -z "$RUST_TARGET" ]; then
+    echo "Error: Could not find Rust target for $OECORE_TARGET_ARCH"
+    exit 1
+fi
+
 BINARY_PATH="$AVOCADO_BUILD_DIR/$RUST_TARGET/release/avocado-conn"
 
 if [ ! -f "$BINARY_PATH" ]; then

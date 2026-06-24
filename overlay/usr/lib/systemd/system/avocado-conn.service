@@ -2,6 +2,11 @@
 Description=Avocado Connect Device Daemon
 After=network.target
 Wants=network.target
+# Don't start (or restart-loop) until the device has been configured. The
+# extension ships config.toml.example, not config.toml — provisioning drops
+# the real file in place. Avoid network-online.target here: on multi-NIC
+# devices an unplugged port makes wait-online hang.
+ConditionPathExists=/etc/avocado-conn/config.toml
 
 [Service]
 ExecStartPre=/bin/mkdir -p /var/lib/avocado/connect
