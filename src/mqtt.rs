@@ -8,7 +8,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tracing::{error, info, warn};
 
-use crate::config::{MqttConfig, RuntimeConfig, TunnelConfig};
+use crate::config::{DownlinkConfig, MqttConfig, RuntimeConfig, TunnelConfig};
 
 const DEVICE_PORT_LO: u16 = 49_152;
 const DEVICE_PORT_HI: u16 = 65_535;
@@ -42,6 +42,7 @@ pub async fn connect_and_run(
     artifacts_url: Option<&str>,
     runtime: Option<RuntimeConfig>,
     avocadoctl_socket: &str,
+    downlink: DownlinkConfig,
 ) -> Result<()> {
     // Read root version from avocadoctl (best-effort, don't fail if unavailable)
     let root_version = varlink_get_root_version(avocadoctl_socket).await;
@@ -173,6 +174,7 @@ pub async fn connect_and_run(
                             avocadoctl_socket,
                             outbox_tx,
                             keepalive_secs,
+                            &downlink,
                         )
                         .await;
                         for reply in replies {
@@ -323,6 +325,7 @@ async fn handle_server_message(
     avocadoctl_socket: &str,
     outbox_tx: &tokio::sync::mpsc::UnboundedSender<String>,
     keepalive_secs: u64,
+    downlink: &DownlinkConfig,
 ) -> Vec<String> {
     let msg: serde_json::Value = match serde_json::from_str(text) {
         Ok(m) => m,
@@ -550,7 +553,57 @@ async fn handle_server_message(
             vec![]
         }
 
+        // Commands destined for local extension agents. avocado-conn owns its
+        // own types (tunnel_*, integer update codes) and forwards these verbatim
+        // so extensions don't open their own cloud connections.
+        Some(t) if t.starts_with("log_") => {
+            forward_downlink("log", downlink.log_socket.as_deref(), t, text).await;
+            vec![]
+        }
+
+        Some(t) if t.starts_with("metrics_") => {
+            forward_downlink("metrics", downlink.metrics_socket.as_deref(), t, text).await;
+            vec![]
+        }
+
         _ => vec![],
+    }
+}
+
+/// Best-effort forward a cloud `cmd/{id}` message to a local extension agent's
+/// control socket (newline-delimited JSON). Fire-and-forget: the agent reports
+/// back over the publish-ingest socket → `event/{id}`, not synchronously here.
+async fn forward_downlink(kind: &str, socket_path: Option<&str>, msg_type: &str, text: &str) {
+    let Some(path) = socket_path else {
+        warn!(
+            kind,
+            msg_type, "received command but no downlink socket configured; dropping"
+        );
+        return;
+    };
+    match UnixStream::connect(path).await {
+        Ok(stream) => {
+            let (_reader, mut writer) = stream.into_split();
+            let mut payload = text.to_string();
+            payload.push('\n');
+            if let Err(e) = writer.write_all(payload.as_bytes()).await {
+                warn!(kind, socket = path, "downlink write failed: {e}");
+                return;
+            }
+            let _ = writer.shutdown().await;
+            info!(
+                kind,
+                msg_type,
+                socket = path,
+                "forwarded command to local agent"
+            );
+        }
+        Err(e) => warn!(
+            kind,
+            msg_type,
+            socket = path,
+            "local agent not reachable: {e}"
+        ),
     }
 }
 
