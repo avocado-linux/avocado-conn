@@ -13,6 +13,38 @@ use crate::config::{MqttConfig, RuntimeConfig, TunnelConfig};
 const DEVICE_PORT_LO: u16 = 49_152;
 const DEVICE_PORT_HI: u16 = 65_535;
 
+/// Set while a runtime update is running, so overlapping nudges are dropped
+/// instead of spawning a second `avocadoctl` update over the top of the first.
+///
+/// Process-wide rather than threaded through `connect_and_run`: the update runs
+/// on a detached task, and the flag has to outlive the MQTT connection that
+/// received the nudge so a reconnect mid-update does not start a second one.
+static UPDATE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Held for the duration of an update, releasing the slot on drop.
+///
+/// RAII rather than an explicit release call: a leaked slot would silently
+/// disable updates for the rest of the process lifetime, so the release has to
+/// cover every exit path including a panic inside the update task.
+struct UpdateSlot;
+
+impl UpdateSlot {
+    /// Take the slot, or `None` if an update is already running.
+    fn claim() -> Option<Self> {
+        if UPDATE_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+            None
+        } else {
+            Some(UpdateSlot)
+        }
+    }
+}
+
+impl Drop for UpdateSlot {
+    fn drop(&mut self) {
+        UPDATE_IN_FLIGHT.store(false, Ordering::SeqCst);
+    }
+}
+
 /// Shared map from tunnel_id to (expiry_unix_secs, tunnel_prn).
 /// Lives across MQTT reconnects so the watchdog can close expired tunnels
 /// even if the tunnel_closed message was never received.
@@ -335,6 +367,15 @@ async fn handle_server_message(
     if msg["type"].as_u64() == Some(0) {
         match (tuf_url, artifacts_url) {
             (Some(tuf), Some(artifacts)) => {
+                // A nudge carries no target — it just means "fetch whatever your
+                // TUF repo now serves". An update already running will pick up
+                // the same target, so a second one would duplicate the download
+                // and race the first on the runtime directory and active symlink.
+                let Some(slot) = UpdateSlot::claim() else {
+                    info!("runtime update already in progress — ignoring nudge");
+                    return vec![];
+                };
+
                 info!(
                     tuf_url = tuf,
                     artifacts_url = artifacts,
@@ -349,6 +390,8 @@ async fn handle_server_message(
                 let keepalive = keepalive_secs;
                 let rat = rat_available.clone();
                 tokio::spawn(async move {
+                    // Dropped when this task ends, however it ends.
+                    let _slot = slot;
                     let event = match varlink_add_from_url(&socket, &tuf, &jwt, Some(&artifacts))
                         .await
                     {
@@ -826,6 +869,36 @@ fn unix_now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_slot_admits_one_holder_and_survives_a_panic() {
+        // Kept as a single test: the slot is process-global and cargo runs tests
+        // in parallel threads, so separate tests would race for it.
+        let first = UpdateSlot::claim();
+        assert!(first.is_some(), "first nudge should take the slot");
+        assert!(
+            UpdateSlot::claim().is_none(),
+            "a nudge arriving mid-update must be dropped"
+        );
+
+        drop(first);
+        let reclaimed = UpdateSlot::claim();
+        assert!(
+            reclaimed.is_some(),
+            "the slot must be reusable once the update finishes"
+        );
+        drop(reclaimed);
+
+        let panicked = std::panic::catch_unwind(|| {
+            let _slot = UpdateSlot::claim().expect("slot should be free");
+            panic!("update blew up");
+        });
+        assert!(panicked.is_err());
+        assert!(
+            UpdateSlot::claim().is_some(),
+            "a panicking update must not leak the slot forever"
+        );
+    }
 
     #[test]
     fn parse_expiry_unix_returns_correct_timestamp() {
