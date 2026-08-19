@@ -30,12 +30,15 @@ struct UpdateSlot;
 
 impl UpdateSlot {
     /// Take the slot, or `None` if an update is already running.
+    ///
+    /// `compare_exchange` rather than `swap`: it leaves the flag untouched when
+    /// the claim fails, so a burst of nudges arriving mid-update does not
+    /// repeatedly write `true` over `true`.
     fn claim() -> Option<Self> {
-        if UPDATE_IN_FLIGHT.swap(true, Ordering::SeqCst) {
-            None
-        } else {
-            Some(UpdateSlot)
-        }
+        UPDATE_IN_FLIGHT
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+            .then_some(UpdateSlot)
     }
 }
 
