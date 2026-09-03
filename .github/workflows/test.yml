@@ -5,6 +5,9 @@ name: Extension Test
 # owns it); each leg calls the single-combo reusable helper. This is separate from pr.yml,
 # which runs the program's unit tests + security audit.
 #
+# The matrix mirrors release.yml: a PR builds against exactly the feeds the tag will
+# publish into, so a combo that cannot resolve fails here rather than at release time.
+#
 # `ext build` validates the extension version, and this extension's version tracks the
 # packaged program (Cargo.toml), so we resolve it here and pass it through as `ext-version`.
 on:
@@ -36,7 +39,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { target: qemux86-64, distro-release: "2024", distro-channel: edge-next }
+          - { target: qemux86-64, distro-release: "2026", distro-channel: next }
+          - { target: qemux86-64, distro-release: "2024", distro-channel: next }
     uses: avocado-linux/actions/.github/workflows/extension-test.yml@v1
     with:
       target:         ${{ matrix.target }}
