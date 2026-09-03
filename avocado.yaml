@@ -6,7 +6,7 @@ extensions:
     # ([package] version) and exports AVOCADO_EXT_VERSION (.github/workflows/release.yml).
     # Locally: `AVOCADO_EXT_VERSION=<x> avocado ext package …` (unset => empty + a warning).
     version: '{{ env.AVOCADO_EXT_VERSION }}'
-    release: r1
+    release: r0
     summary: Avocado Connect daemon
     description: Avocado Connect daemon
     license: Apache-2.0
