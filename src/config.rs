@@ -301,9 +301,30 @@ impl AgentConfig {
         }
         let tmp = path.with_extension("tmp");
         let data = serde_json::to_string_pretty(state)?;
-        fs::write(&tmp, &data).with_context(|| format!("writing {}", tmp.display()))?;
+        // Durable before visible: a power cut right after the claim must not
+        // leave an empty state file (the claim token is single-use, so the
+        // device could never recover on its own). fsync the data, rename,
+        // then fsync the directory so the rename itself is on disk.
+        {
+            use std::io::Write;
+            let mut opts = fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts
+                .open(&tmp)
+                .with_context(|| format!("writing {}", tmp.display()))?;
+            f.write_all(data.as_bytes())?;
+            f.sync_all()?;
+        }
         fs::rename(&tmp, &path)
             .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
+        if let Some(parent) = path.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -320,5 +341,49 @@ impl AgentConfig {
     /// Check if claim-based provisioning is configured.
     pub fn needs_claim(&self) -> bool {
         self.claim_token.is_some() && !self.is_claimed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claimed_state_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!("conn-claim-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let cfg = AgentConfig {
+            data_dir: Some(dir.join("state").to_string_lossy().into()),
+            claim_token: Some("single-use".into()),
+            ..Default::default()
+        };
+        let state: ClaimedState = serde_json::from_str(
+            r#"{"device_id":"d1","mqtt":{"username":"u","password":"p","client_id":"c"},
+                "tuf_url":null,"artifacts_url":null,"claimed_at":"now"}"#,
+        )
+        .unwrap();
+        cfg.save_claimed_state(&state).unwrap();
+
+        // A fresh config (as after a restart) sees the claim and won't re-claim.
+        let restarted = AgentConfig {
+            data_dir: cfg.data_dir.clone(),
+            claim_token: cfg.claim_token.clone(),
+            ..Default::default()
+        };
+        assert!(!restarted.needs_claim());
+        let loaded = restarted.load_claimed_state().unwrap().unwrap();
+        assert_eq!(loaded.device_id, "d1");
+        assert_eq!(loaded.mqtt.password, "p");
+        let path = restarted.state_file_path().unwrap();
+        assert!(!path.with_extension("tmp").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 }
