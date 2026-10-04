@@ -16,6 +16,10 @@ use tracing::{info, warn};
 /// is gone or wedged, and dropping is better than unbounded growth (the
 /// server re-sends unfinished commands on reconnect).
 pub const QUEUE: usize = 256;
+/// Messages held while the handler is unreachable (it may start after
+/// conn, and the server re-sends pending commands only when the device
+/// comes online). Oldest dropped beyond this; handlers dedupe by id.
+const HOLD: usize = 64;
 
 /// Event types avocado-conn itself publishes. A handler may not emit these,
 /// so a local process cannot forge tunnel or shadow state.
@@ -38,21 +42,33 @@ pub fn outbound(line: &str) -> Option<String> {
 
 /// Keep a connection to `socket`, forwarding `inbound` lines to it and its
 /// lines to `outbox`. Reconnects with backoff; lines that arrive while the
-/// handler is unreachable are dropped.
+/// handler is unreachable are held (bounded by `HOLD`) and sent on reconnect.
 pub async fn run(
     socket: String,
     mut inbound: mpsc::Receiver<String>,
     outbox: mpsc::UnboundedSender<String>,
 ) {
     let mut backoff = Duration::from_secs(1);
+    let mut held: std::collections::VecDeque<String> = Default::default();
     loop {
         match UnixStream::connect(&socket).await {
             Ok(stream) => {
-                info!(%socket, "local handler connected");
+                info!(%socket, held = held.len(), "local handler connected");
                 backoff = Duration::from_secs(1);
                 let (rd, mut wr) = stream.into_split();
                 let mut lines = BufReader::new(rd).lines();
+                let mut flushed = true; // false: the held backlog could not be written
+                while let Some(m) = held.pop_front() {
+                    if wr.write_all(format!("{m}\n").as_bytes()).await.is_err() {
+                        held.push_front(m);
+                        flushed = false;
+                        break;
+                    }
+                }
                 loop {
+                    if !flushed {
+                        break;
+                    }
                     tokio::select! {
                         line = lines.next_line() => match line {
                             Ok(Some(l)) => {
@@ -63,10 +79,10 @@ pub async fn run(
                             Ok(None) | Err(_) => break,
                         },
                         msg = inbound.recv() => {
-                            let Some(mut m) = msg else { return };
-                            m.push('\n');
-                            if wr.write_all(m.as_bytes()).await.is_err() {
-                                warn!("local handler: write failed, message dropped");
+                            let Some(m) = msg else { return };
+                            if wr.write_all(format!("{m}\n").as_bytes()).await.is_err() {
+                                warn!("local handler: write failed, holding message");
+                                held.push_back(m);
                                 break;
                             }
                         }
@@ -76,14 +92,21 @@ pub async fn run(
             }
             Err(e) => warn!(%socket, "local handler unreachable: {e}"),
         }
-        // Drain while waiting so senders never block on a dead handler.
+        // Hold (bounded) while waiting so senders never block on a dead
+        // handler and a handler that starts late still gets its commands.
         let wait = tokio::time::sleep(backoff);
         tokio::pin!(wait);
         loop {
             tokio::select! {
                 _ = &mut wait => break,
                 msg = inbound.recv() => match msg {
-                    Some(_) => warn!("local handler unreachable, message dropped"),
+                    Some(m) => {
+                        if held.len() == HOLD {
+                            held.pop_front();
+                            warn!("local handler unreachable, oldest held message dropped");
+                        }
+                        held.push_back(m);
+                    }
                     None => return,
                 },
             }
@@ -110,6 +133,30 @@ mod tests {
         assert!(outbound(r#"{"type":0}"#).is_none());
         assert!(outbound("not json").is_none());
         assert!(outbound(r#"["type"]"#).is_none());
+    }
+
+    #[tokio::test]
+    async fn holds_messages_until_the_handler_appears() {
+        let dir = std::env::temp_dir().join(format!("lh-hold-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("h.sock");
+        let _ = std::fs::remove_file(&path);
+        let (in_tx, in_rx) = mpsc::channel(QUEUE);
+        let (out_tx, _out_rx) = mpsc::unbounded_channel();
+        tokio::spawn(run(path.to_string_lossy().into(), in_rx, out_tx));
+        in_tx
+            .send(r#"{"type":"command","id":"early"}"#.into())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let (s, _) = listener.accept().await.unwrap();
+        let mut lines = BufReader::new(s).lines();
+        assert_eq!(
+            lines.next_line().await.unwrap().unwrap(),
+            r#"{"type":"command","id":"early"}"#
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
