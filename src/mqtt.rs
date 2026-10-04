@@ -42,6 +42,7 @@ pub async fn connect_and_run(
     artifacts_url: Option<&str>,
     runtime: Option<RuntimeConfig>,
     avocadoctl_socket: &str,
+    local_handler: Option<&tokio::sync::mpsc::Sender<String>>,
 ) -> Result<()> {
     // Read root version from avocadoctl (best-effort, don't fail if unavailable)
     let root_version = varlink_get_root_version(avocadoctl_socket).await;
@@ -173,6 +174,7 @@ pub async fn connect_and_run(
                             avocadoctl_socket,
                             outbox_tx,
                             keepalive_secs,
+                            local_handler,
                         )
                         .await;
                         for reply in replies {
@@ -331,6 +333,7 @@ async fn handle_server_message(
     avocadoctl_socket: &str,
     outbox_tx: &tokio::sync::mpsc::UnboundedSender<String>,
     keepalive_secs: u64,
+    local_handler: Option<&tokio::sync::mpsc::Sender<String>>,
 ) -> Vec<String> {
     let msg: serde_json::Value = match serde_json::from_str(text) {
         Ok(m) => m,
@@ -558,7 +561,16 @@ async fn handle_server_message(
             vec![]
         }
 
-        _ => vec![],
+        // Not ours: hand it to the local handler, if one is configured.
+        Some(ty) => {
+            if let Some(tx) = local_handler
+                && tx.try_send(text.to_string()).is_err()
+            {
+                warn!(ty, "local handler queue full or closed, message dropped");
+            }
+            vec![]
+        }
+        None => vec![],
     }
 }
 
@@ -834,6 +846,41 @@ fn unix_now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn handle(text: &str, lh: Option<&tokio::sync::mpsc::Sender<String>>) -> Vec<String> {
+        let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+        handle_server_message(
+            text,
+            &mut HashMap::new(),
+            &crate::config::TunnelConfig::default(),
+            &Arc::new(Mutex::new(HashMap::new())),
+            &Arc::new(AtomicBool::new(false)),
+            "",
+            "",
+            None,
+            None,
+            &None,
+            "/nonexistent.sock",
+            &out_tx,
+            30,
+            lh,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn unknown_types_go_to_the_local_handler_only_when_configured() {
+        let msg = r#"{"type":"something_else","id":"1"}"#;
+        // Unconfigured: ignored exactly as before the local handler existed.
+        assert!(handle(msg, None).await.is_empty());
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        assert!(handle(msg, Some(&tx)).await.is_empty());
+        assert_eq!(rx.try_recv().unwrap(), msg);
+        // Untyped messages are never forwarded.
+        assert!(handle(r#"{"id":"2"}"#, Some(&tx)).await.is_empty());
+        assert!(rx.try_recv().is_err());
+    }
 
     #[test]
     fn parse_expiry_unix_returns_correct_timestamp() {

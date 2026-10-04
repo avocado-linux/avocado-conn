@@ -66,3 +66,14 @@ keepalive_secs = 30
 # username = "DEVICE_UUID"
 # password = "DEVICE_JWT"
 # client_id = "device-DEVICE_UUID"
+
+# ---------------------------------------------------------------------------
+# Local handler (optional)
+# ---------------------------------------------------------------------------
+# Unix socket of a local process that handles server commands avocado-conn
+# does not handle itself. Such messages are written to the socket as JSON
+# lines, and each JSON line the process writes back is published as an
+# event. Event types avocado-conn owns (shadow, tunnel_*, update_result) are
+# dropped. Leave unset when no such process runs.
+# [local_handler]
+# socket = "/run/my-handler/api.sock"
