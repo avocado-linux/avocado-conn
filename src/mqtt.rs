@@ -27,6 +27,12 @@ struct TunnelPrep {
     tunnel_prn: String,
 }
 
+/// Largest MQTT packet accepted or sent. Fits both brokers Connect runs:
+/// EMQX's default `max_packet_size` (1 MiB) and RabbitMQ's far larger
+/// authenticated limit. rumqttc grows its read buffer on demand, so this is
+/// a ceiling, not an allocation; steady-state memory is unchanged.
+const MAX_PACKET: usize = 1 << 20;
+
 #[allow(clippy::too_many_arguments)]
 pub async fn connect_and_run(
     cfg: &MqttConfig,
@@ -70,6 +76,10 @@ pub async fn connect_and_run(
     let mut options = MqttOptions::new(&cfg.client_id, &cfg.host, cfg.port);
     options.set_credentials(&cfg.username, &cfg.password);
     options.set_keep_alive(Duration::from_secs(keepalive_secs.max(10)));
+    // rumqttc defaults to 10 KiB each way and drops the connection on a
+    // bigger packet; with a persistent session the broker then redelivers
+    // the same QoS1 message forever.
+    options.set_max_packet_size(MAX_PACKET, MAX_PACKET);
     // Persistent session — EMQX queues cmd/+ messages while device is offline.
     options.set_clean_session(false);
     // LWT: broker publishes 0x00 to presence/{device_id} on unexpected disconnect.
