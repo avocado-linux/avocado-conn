@@ -53,6 +53,16 @@ pub struct AgentConfig {
     /// Must align with where avocadoctl expects to find root.json.
     #[serde(default = "default_metadata_dir")]
     pub metadata_dir: String,
+    /// Optional local handler process (see `local_handler`). Unset: off.
+    #[serde(default)]
+    pub local_handler: Option<LocalHandlerConfig>,
+}
+
+/// `[local_handler]`: Unix socket of a local process that receives server
+/// messages conn doesn't handle itself and whose lines are published as events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalHandlerConfig {
+    pub socket: String,
 }
 
 /// Credentials and metadata persisted after a successful device claim.
@@ -185,6 +195,7 @@ impl Default for AgentConfig {
             mqtt_host: default_mqtt_host(),
             mqtt_port: default_mqtt_port(),
             metadata_dir: default_metadata_dir(),
+            local_handler: None,
         }
     }
 }
