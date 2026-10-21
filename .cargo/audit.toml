@@ -15,6 +15,11 @@ ignore = [
     "RUSTSEC-2026-0098", # Name constraints for URI names incorrectly accepted
     "RUSTSEC-2026-0099", # Name constraints accepted for wildcard cert names
     "RUSTSEC-2026-0104", # Reachable panic in CRL parsing
+    # Distrusted eMudhra intermediates. rumqttc only uses 0.102.x for its
+    # TlsError::WebPki variant. Certificate checks run in rustls 0.23 with
+    # rustls-webpki 0.103.16, which has the fix, and webpki-roots 1.0.10
+    # no longer has the affected roots. Same close condition as above.
+    "RUSTSEC-2026-0382",
 
     # rustls-pemfile 2.2.0 — unmaintained notice. Functionality has moved to
     # rustls-pki-types. Transitive via rumqttc 0.25. No runtime impact;
