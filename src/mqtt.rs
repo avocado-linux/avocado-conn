@@ -231,6 +231,15 @@ pub async fn connect_and_run(
     }
 }
 
+/// Build a `tunnel_close` server notification for a tunnel.
+///
+/// The server route matches `%{"type" => "tunnel_close", "tunnel_id" => id}`
+/// and uses the value for `Relay.get_tunnel(id)`, the same `tunnel_id` key
+/// every other tunnel_* event uses. The value is the tunnel id, not the prn.
+fn tunnel_close_msg(tunnel_id: &str) -> String {
+    serde_json::json!({"type": "tunnel_close", "tunnel_id": tunnel_id}).to_string()
+}
+
 /// Close all active tunnels via rat and enqueue `tunnel_close` server
 /// notifications into the outbox. Called during graceful shutdown before
 /// signaling the MQTT loop to exit.
@@ -240,12 +249,12 @@ pub async fn shutdown_tunnels(
     outbox: &tokio::sync::mpsc::UnboundedSender<String>,
 ) {
     // Drain the map atomically so the watchdog won't also try to close these.
-    let tunnels: Vec<(String, String)> = {
+    let tunnels: Vec<String> = {
         let mut map = active_tunnels.lock().unwrap();
-        map.drain().map(|(id, (_, prn))| (id, prn)).collect()
+        map.drain().map(|(id, _)| id).collect()
     };
 
-    for (tunnel_id, tunnel_prn) in tunnels {
+    for tunnel_id in tunnels {
         info!(tunnel_id, "graceful shutdown — closing tunnel via rat");
         let req = serde_json::json!({"command": "close", "id": tunnel_id});
         match rat_call(rat_socket_path, &req).await {
@@ -253,7 +262,7 @@ pub async fn shutdown_tunnels(
             Err(e) => warn!(tunnel_id, "graceful shutdown rat close failed: {e:#}"),
         }
         // Queue server notification — MQTT loop drains these before closing.
-        let msg = serde_json::json!({"type": "tunnel_close", "tunnel_prn": tunnel_prn}).to_string();
+        let msg = tunnel_close_msg(&tunnel_id);
         let _ = outbox.send(msg);
     }
 }
@@ -273,7 +282,7 @@ pub async fn expiry_watchdog(
 
         let now = unix_now_secs();
 
-        let expired: Vec<(String, String)> = {
+        let expired: Vec<String> = {
             let map = active_tunnels.lock().unwrap();
             for (id, (exp, _)) in map.iter() {
                 let remaining = (*exp).saturating_sub(now);
@@ -284,19 +293,18 @@ pub async fn expiry_watchdog(
             }
             map.iter()
                 .filter(|&(_, (exp, _))| *exp <= now)
-                .map(|(id, (_, prn))| (id.clone(), prn.clone()))
+                .map(|(id, _)| id.clone())
                 .collect()
         };
 
-        for (tunnel_id, tunnel_prn) in expired {
+        for tunnel_id in expired {
             warn!(tunnel_id, "tunnel TTL elapsed locally — closing interface");
             let req = serde_json::json!({"command": "close", "id": tunnel_id});
             match rat_call(&rat_socket_path, &req).await {
                 Ok(_) => info!(tunnel_id, "expiry watchdog closed tunnel"),
                 Err(e) => warn!(tunnel_id, "expiry watchdog rat close failed: {e:#}"),
             }
-            let msg =
-                serde_json::json!({"type": "tunnel_close", "tunnel_prn": tunnel_prn}).to_string();
+            let msg = tunnel_close_msg(&tunnel_id);
             if outbox.send(msg).is_err() {
                 warn!(
                     tunnel_id,
@@ -881,5 +889,21 @@ mod tests {
             .to_rfc3339();
         let secs = remaining_ttl_secs(&ts_str);
         assert!(secs > 7190 && secs <= 7200, "expected ~7200, got {secs}");
+    }
+
+    #[test]
+    fn tunnel_close_msg_uses_tunnel_id_key() {
+        // The server route matches `%{"type" => "tunnel_close", "tunnel_id" => id}`
+        // and uses the value for `Relay.get_tunnel(id)`. A message keyed on
+        // `tunnel_prn` falls through to the catch-all and the tunnel is never
+        // closed server-side. Every other tunnel_* event keys on `tunnel_id`.
+        let msg: serde_json::Value =
+            serde_json::from_str(&tunnel_close_msg("tunnel-abc123")).unwrap();
+        assert_eq!(msg["type"], "tunnel_close");
+        assert_eq!(msg["tunnel_id"], "tunnel-abc123");
+        assert!(
+            msg.get("tunnel_prn").is_none(),
+            "server does not read tunnel_prn; it must not be the lookup key"
+        );
     }
 }
