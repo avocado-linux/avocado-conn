@@ -31,7 +31,7 @@ struct TunnelPrep {
 /// EMQX's default `max_packet_size` (1 MiB) and RabbitMQ's far larger
 /// authenticated limit. rumqttc grows its read buffer on demand, so this is
 /// a ceiling, not an allocation; steady-state memory is unchanged.
-const MAX_PACKET: usize = 1 << 20;
+pub(crate) const MAX_PACKET: usize = 1 << 20;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn connect_and_run(
@@ -40,6 +40,7 @@ pub async fn connect_and_run(
     tunnel_cfg: TunnelConfig,
     active_tunnels: ActiveTunnels,
     outbox: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    handler_events: &mut tokio::sync::mpsc::Receiver<String>,
     outbox_tx: &tokio::sync::mpsc::UnboundedSender<String>,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
     rat_available: Arc<AtomicBool>,
@@ -115,6 +116,12 @@ pub async fn connect_and_run(
         loop {
             let result = eventloop.poll().await;
             let is_err = result.is_err();
+            // Forward only what the loop acts on. Forwarding every publish's
+            // Outgoing/PubAck events let a burst fill evt_tx while the loop
+            // sat in client.publish, deadlocking both sides.
+            if !forwarded(&result) {
+                continue;
+            }
             if evt_tx.send(result).await.is_err() {
                 break;
             }
@@ -209,6 +216,16 @@ pub async fn connect_and_run(
                     }
                 }
             }
+            Some(event) = handler_events.recv() => {
+                if let Err(e) = client
+                    .publish(&event_topic, QoS::AtLeastOnce, false, event)
+                    .await
+                {
+                    error!("failed to publish local handler event: {e}");
+                    el_task.abort();
+                    bail!("handler event publish failed: {e}");
+                }
+            }
             Some(queued) = outbox.recv() => {
                 if let Err(e) = client
                     .publish(&event_topic, QoS::AtLeastOnce, false, queued)
@@ -241,6 +258,18 @@ pub async fn connect_and_run(
             }
         }
     }
+}
+
+/// Eventloop results the connection loop acts on; everything else is dropped
+/// in the eventloop task so it can never back up the channel.
+fn forwarded(result: &Result<Event, rumqttc::ConnectionError>) -> bool {
+    matches!(
+        result,
+        Err(_)
+            | Ok(Event::Incoming(
+                Packet::ConnAck(_) | Packet::Publish(_) | Packet::Disconnect
+            ))
+    )
 }
 
 /// Build a `tunnel_close` server notification for a tunnel.
@@ -574,7 +603,7 @@ async fn handle_server_message(
         // Not ours: hand it to the local handler, if one is configured.
         Some(ty) => {
             if let Some(tx) = local_handler
-                && tx.try_send(text.to_string()).is_err()
+                && tx.try_send(msg.to_string()).is_err()
             {
                 warn!(ty, "local handler queue full or closed, message dropped");
             }
@@ -886,10 +915,41 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         assert!(handle(msg, Some(&tx)).await.is_empty());
-        assert_eq!(rx.try_recv().unwrap(), msg);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&rx.try_recv().unwrap()).unwrap(),
+            serde_json::from_str::<serde_json::Value>(msg).unwrap()
+        );
         // Untyped messages are never forwarded.
         assert!(handle(r#"{"id":"2"}"#, Some(&tx)).await.is_empty());
         assert!(rx.try_recv().is_err());
+        // Pretty-printed JSON still reaches the handler as one line.
+        handle("{\n  \"type\": \"x\",\n  \"id\": \"3\"\n}", Some(&tx)).await;
+        let fwd = rx.try_recv().unwrap();
+        assert!(!fwd.contains('\n'));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&fwd).unwrap()["id"],
+            "3"
+        );
+    }
+
+    #[test]
+    fn eventloop_forwards_only_what_the_loop_acts_on() {
+        use rumqttc::{ConnAck, ConnectReturnCode, Outgoing, PubAck, Publish};
+        let ack = ConnAck {
+            session_present: false,
+            code: ConnectReturnCode::Success,
+        };
+        assert!(forwarded(&Ok(Event::Incoming(Packet::ConnAck(ack)))));
+        let p = Publish::new("cmd/x", QoS::AtLeastOnce, "{}");
+        assert!(forwarded(&Ok(Event::Incoming(Packet::Publish(p)))));
+        assert!(forwarded(&Ok(Event::Incoming(Packet::Disconnect))));
+        assert!(forwarded(&Err(rumqttc::ConnectionError::RequestsDone)));
+        // The per-publish chatter that used to fill the channel is dropped.
+        assert!(!forwarded(&Ok(Event::Outgoing(Outgoing::Publish(1)))));
+        assert!(!forwarded(&Ok(Event::Incoming(Packet::PubAck(
+            PubAck::new(1)
+        )))));
+        assert!(!forwarded(&Ok(Event::Incoming(Packet::PingResp))));
     }
 
     #[test]
