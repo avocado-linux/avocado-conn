@@ -53,6 +53,16 @@ pub struct AgentConfig {
     /// Must align with where avocadoctl expects to find root.json.
     #[serde(default = "default_metadata_dir")]
     pub metadata_dir: String,
+    /// Optional local handler process (see `local_handler`). Unset: off.
+    #[serde(default)]
+    pub local_handler: Option<LocalHandlerConfig>,
+}
+
+/// `[local_handler]`: Unix socket of a local process that receives server
+/// messages conn doesn't handle itself and whose lines are published as events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalHandlerConfig {
+    pub socket: String,
 }
 
 /// Credentials and metadata persisted after a successful device claim.
@@ -185,6 +195,7 @@ impl Default for AgentConfig {
             mqtt_host: default_mqtt_host(),
             mqtt_port: default_mqtt_port(),
             metadata_dir: default_metadata_dir(),
+            local_handler: None,
         }
     }
 }
@@ -290,13 +301,37 @@ impl AgentConfig {
         }
         let tmp = path.with_extension("tmp");
         let data = serde_json::to_string_pretty(state)?;
-        fs::write(&tmp, &data).with_context(|| format!("writing {}", tmp.display()))?;
+        // Durable before visible: a power cut right after the claim must not
+        // leave an empty state file (the claim token is single-use, so the
+        // device could never recover on its own). fsync the data, rename,
+        // then fsync the directory so the rename itself is on disk.
+        // A .tmp left by an earlier crash may have a wider mode; `mode()` only
+        // applies on create, so start from a fresh file.
+        let _ = fs::remove_file(&tmp);
+        {
+            use std::io::Write;
+            let mut opts = fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts
+                .open(&tmp)
+                .with_context(|| format!("writing {}", tmp.display()))?;
+            f.write_all(data.as_bytes())?;
+            f.sync_all()?;
+        }
         fs::rename(&tmp, &path)
             .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        // Make the rename durable, and data_dir's own entry too: it may have
+        // been created moments ago (service mkdir or create_dir_all above).
+        if let Some(parent) = path.parent() {
+            fs::File::open(parent)?.sync_all()?;
+            if let Some(grandparent) = parent.parent() {
+                fs::File::open(grandparent)?.sync_all()?;
+            }
         }
         Ok(())
     }
@@ -309,5 +344,59 @@ impl AgentConfig {
     /// Check if claim-based provisioning is configured.
     pub fn needs_claim(&self) -> bool {
         self.claim_token.is_some() && !self.is_claimed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claimed_state_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!("conn-claim-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let cfg = AgentConfig {
+            data_dir: Some(dir.join("state").to_string_lossy().into()),
+            claim_token: Some("single-use".into()),
+            ..Default::default()
+        };
+        let state: ClaimedState = serde_json::from_str(
+            r#"{"device_id":"d1","mqtt":{"username":"u","password":"p","client_id":"c"},
+                "tuf_url":null,"artifacts_url":null,"claimed_at":"now"}"#,
+        )
+        .unwrap();
+        // A stale, world-readable .tmp from an earlier crash must not leak
+        // the credentials.
+        let tmp = cfg.state_file_path().unwrap().with_extension("tmp");
+        fs::create_dir_all(tmp.parent().unwrap()).unwrap();
+        fs::write(&tmp, "stale").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        cfg.save_claimed_state(&state).unwrap();
+
+        // A fresh config (as after a restart) sees the claim and won't re-claim.
+        let restarted = AgentConfig {
+            data_dir: cfg.data_dir.clone(),
+            claim_token: cfg.claim_token.clone(),
+            ..Default::default()
+        };
+        assert!(!restarted.needs_claim());
+        let loaded = restarted.load_claimed_state().unwrap().unwrap();
+        assert_eq!(loaded.device_id, "d1");
+        assert_eq!(loaded.mqtt.password, "p");
+        let path = restarted.state_file_path().unwrap();
+        assert!(!path.with_extension("tmp").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -7,6 +7,7 @@ mod agent;
 mod claim;
 mod config;
 mod device_id;
+mod local_handler;
 mod mqtt;
 
 use config::AgentConfig;
@@ -127,6 +128,7 @@ async fn run_daemon(config: AgentConfig) -> Result<()> {
         artifacts_url,
         config.runtime,
         config.avocadoctl_socket,
+        config.local_handler.map(|h| h.socket),
     )
     .await
 }
