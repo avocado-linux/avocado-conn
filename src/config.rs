@@ -305,6 +305,9 @@ impl AgentConfig {
         // leave an empty state file (the claim token is single-use, so the
         // device could never recover on its own). fsync the data, rename,
         // then fsync the directory so the rename itself is on disk.
+        // A .tmp left by an earlier crash may have a wider mode; `mode()` only
+        // applies on create, so start from a fresh file.
+        let _ = fs::remove_file(&tmp);
         {
             use std::io::Write;
             let mut opts = fs::OpenOptions::new();
@@ -322,13 +325,13 @@ impl AgentConfig {
         }
         fs::rename(&tmp, &path)
             .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
+        // Make the rename durable, and data_dir's own entry too: it may have
+        // been created moments ago (service mkdir or create_dir_all above).
         if let Some(parent) = path.parent() {
             fs::File::open(parent)?.sync_all()?;
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+            if let Some(grandparent) = parent.parent() {
+                fs::File::open(grandparent)?.sync_all()?;
+            }
         }
         Ok(())
     }
@@ -362,6 +365,16 @@ mod tests {
                 "tuf_url":null,"artifacts_url":null,"claimed_at":"now"}"#,
         )
         .unwrap();
+        // A stale, world-readable .tmp from an earlier crash must not leak
+        // the credentials.
+        let tmp = cfg.state_file_path().unwrap().with_extension("tmp");
+        fs::create_dir_all(tmp.parent().unwrap()).unwrap();
+        fs::write(&tmp, "stale").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644)).unwrap();
+        }
         cfg.save_claimed_state(&state).unwrap();
 
         // A fresh config (as after a restart) sees the claim and won't re-claim.
