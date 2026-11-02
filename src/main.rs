@@ -8,6 +8,7 @@ mod claim;
 mod config;
 mod device_id;
 mod mqtt;
+mod tls;
 
 use config::AgentConfig;
 

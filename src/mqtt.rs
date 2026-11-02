@@ -82,14 +82,8 @@ pub async fn connect_and_run(
     // TLS: explicit from claim response, or auto-detect by port (8883 = TLS).
     let use_tls = cfg.tls.unwrap_or(cfg.port == 8883);
     if use_tls {
-        use rumqttc::tokio_rustls::rustls;
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let tls_config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
         options.set_transport(rumqttc::Transport::tls_with_config(
-            rumqttc::TlsConfiguration::Rustls(Arc::new(tls_config)),
+            rumqttc::TlsConfiguration::Rustls(Arc::new(crate::tls::client_config())),
         ));
         info!("MQTT TLS enabled");
     }

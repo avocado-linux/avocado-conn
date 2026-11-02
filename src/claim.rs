@@ -252,6 +252,7 @@ async fn claim_once(config: &AgentConfig) -> Result<ClaimedState, AttemptError> 
         .map_err(|e| permanent("device_id_resolution_failed", e.to_string()))?;
 
     let client = reqwest::Client::builder()
+        .use_preconfigured_tls(crate::tls::client_config())
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|e| transient("client_build_failed", e.to_string()))?;
