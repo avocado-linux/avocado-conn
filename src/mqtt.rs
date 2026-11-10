@@ -110,8 +110,12 @@ pub async fn connect_and_run(
 
     // Poll the eventloop in a background task — rumqttc requires continuous polling
     // to process both outgoing publishes and incoming packets.
+    // Unbounded so el_task never stops polling: a full channel here stalled
+    // the eventloop, which stopped draining the request queue that
+    // client.publish waits on. It carries only what `forwarded` lets through,
+    // so it holds at most the broker's queued backlog.
     let (evt_tx, mut evt_rx) =
-        tokio::sync::mpsc::channel::<Result<Event, rumqttc::ConnectionError>>(64);
+        tokio::sync::mpsc::unbounded_channel::<Result<Event, rumqttc::ConnectionError>>();
     let el_task = tokio::spawn(async move {
         loop {
             let result = eventloop.poll().await;
@@ -122,7 +126,7 @@ pub async fn connect_and_run(
             if !forwarded(&result) {
                 continue;
             }
-            if evt_tx.send(result).await.is_err() {
+            if evt_tx.send(result).is_err() {
                 break;
             }
             if is_err {

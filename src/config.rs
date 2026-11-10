@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AgentConfig {
@@ -328,9 +328,9 @@ impl AgentConfig {
         // Make the rename durable, and data_dir's own entry too: it may have
         // been created moments ago (service mkdir or create_dir_all above).
         if let Some(parent) = path.parent() {
-            fs::File::open(parent)?.sync_all()?;
+            sync_dir(parent)?;
             if let Some(grandparent) = parent.parent() {
-                fs::File::open(grandparent)?.sync_all()?;
+                sync_dir(grandparent)?;
             }
         }
         Ok(())
@@ -347,9 +347,28 @@ impl AgentConfig {
     }
 }
 
+/// fsync a directory. A relative path's last parent is "", which means the
+/// current directory.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    fs::File::open(dir)?.sync_all()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_relative_data_dir_syncs_the_current_directory() {
+        // data_dir = "state" gives a grandparent of "".
+        let parent = Path::new("state/claimed_state.json").parent().unwrap();
+        assert_eq!(parent.parent(), Some(Path::new("")));
+        sync_dir(parent.parent().unwrap()).unwrap();
+    }
 
     #[test]
     fn claimed_state_survives_a_restart() {

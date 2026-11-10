@@ -1,7 +1,7 @@
 //! Optional bridge to a local handler process over a Unix socket.
 //!
 //! Domain-free: server messages whose `type` avocado-conn does not handle
-//! itself are written to the socket verbatim, one JSON line each, and every
+//! itself are written to the socket as compact JSON, one line each, and every
 //! JSON line the handler writes back is published on `event/{device_id}`.
 //! Off unless `[local_handler] socket` is configured, so devices that don't
 //! run a handler behave exactly as before.
