@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use tokio::time::Duration;
 use tracing::{info, warn};
 
-use crate::config::{IntervalConfig, MqttConfig, RuntimeConfig, TunnelConfig};
+use crate::config::{DownlinkConfig, IntervalConfig, MqttConfig, RuntimeConfig, TunnelConfig};
 use crate::mqtt;
 
 async fn probe_rat(socket_path: &str) -> bool {
@@ -22,6 +22,8 @@ pub async fn run(
     artifacts_url: Option<String>,
     runtime: Option<RuntimeConfig>,
     avocadoctl_socket: String,
+    publish_socket: String,
+    downlink: DownlinkConfig,
 ) -> Result<()> {
     let initial = probe_rat(&tunnel_config.rat_socket_path).await;
     let rat_available = Arc::new(AtomicBool::new(initial));
@@ -98,6 +100,16 @@ pub async fn run(
         });
     }
 
+    // Publish-ingest socket: on-device extensions → cloud event/{id}.
+    // Independent of the MQTT connection; queues into the same outbox.
+    {
+        let tx = outbox_tx.clone();
+        let sock = publish_socket.clone();
+        tokio::spawn(async move {
+            crate::publish::run(sock, tx).await;
+        });
+    }
+
     // MQTT connect loop with auto-reconnect.
     let mqtt_handle = tokio::spawn({
         let tunnels = active_tunnels.clone();
@@ -119,6 +131,7 @@ pub async fn run(
                     artifacts_url.as_deref(),
                     runtime.clone(),
                     &avocadoctl_socket,
+                    downlink.clone(),
                 )
                 .await
                 {

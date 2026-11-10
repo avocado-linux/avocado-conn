@@ -33,6 +33,17 @@ pub struct AgentConfig {
     #[serde(default = "default_avocadoctl_socket")]
     pub avocadoctl_socket: String,
 
+    /// Local Unix socket where on-device extensions publish events to be
+    /// forwarded to the cloud on `event/{id}`. Turns avocado-conn into a generic
+    /// device→cloud event bus for avocado-logd / avocado-metricsd / etc.
+    /// Set to "" to disable.
+    #[serde(default = "default_publish_socket")]
+    pub publish_socket: String,
+    /// Routes for cloud→device commands destined for local extension agents
+    /// (`log_*` → avocado-logd, `metrics_*` → avocado-metricsd).
+    #[serde(default)]
+    pub downlink: DownlinkConfig,
+
     /// Claim token for initial device provisioning.
     /// If present and no saved credentials exist, the daemon will self-claim
     /// by calling POST {api_url}/api/device/claim.
@@ -78,6 +89,27 @@ fn default_api_url() -> String {
 
 fn default_avocadoctl_socket() -> String {
     "unix:/run/avocado/avocadoctl.sock".to_string()
+}
+
+fn default_publish_socket() -> String {
+    "/run/avocado-conn/publish.sock".to_string()
+}
+
+/// Routes for cloud→device commands destined for local extension agents.
+///
+/// `avocado-conn` owns its own message types (`tunnel_*`, integer update codes).
+/// Any `cmd/{id}` message whose `type` starts with a known prefix is forwarded
+/// verbatim to the matching agent's control socket (best-effort). This lets the
+/// backend drive `avocado-logd` / `avocado-metricsd` through the single
+/// connection without those agents opening their own cloud links.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DownlinkConfig {
+    /// Socket for `log_*` commands (avocado-logd). `None` → drop with a warning.
+    #[serde(default)]
+    pub log_socket: Option<String>,
+    /// Socket for `metrics_*` commands (avocado-metricsd). `None` → drop with a warning.
+    #[serde(default)]
+    pub metrics_socket: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,6 +212,8 @@ impl Default for AgentConfig {
             artifacts_url: None,
             runtime: None,
             avocadoctl_socket: default_avocadoctl_socket(),
+            publish_socket: default_publish_socket(),
+            downlink: DownlinkConfig::default(),
             claim_token: None,
             device_id_source: None,
             mqtt_host: default_mqtt_host(),

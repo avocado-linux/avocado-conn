@@ -49,6 +49,23 @@ api_url = "https://connect.example.com"
 keepalive_secs = 30
 
 # ---------------------------------------------------------------------------
+# Event publish ingest (on-device extensions → cloud event/{id})
+# ---------------------------------------------------------------------------
+# Local Unix socket where extensions (avocado-logd, avocado-metricsd, …) write
+# newline-delimited JSON objects, each forwarded to the cloud on event/{id}.
+# Every object must carry a string "type". Default shown; set to "" to disable.
+# publish_socket = "/run/avocado-conn/publish.sock"
+
+# ---------------------------------------------------------------------------
+# Downlink routes (cloud cmd/{id} → local extension sockets)
+# ---------------------------------------------------------------------------
+# cmd/{id} messages whose "type" starts with log_ / metrics_ are forwarded
+# verbatim to the matching agent's control socket (best-effort).
+# [downlink]
+# log_socket = "/run/avocado-logd.sock"
+# metrics_socket = "/run/avocado-metricsd.sock"
+
+# ---------------------------------------------------------------------------
 # Tunnel (optional)
 # ---------------------------------------------------------------------------
 
