@@ -583,8 +583,17 @@ async fn handle_server_message(
                     vec![ack, configure]
                 }
                 Err(e) => {
+                    // Tell the server, or the tunnel sits at "requested"
+                    // until it expires with no reason anywhere but here.
                     error!(tunnel_id, "failed to prepare tunnel: {e:#}");
-                    vec![]
+                    vec![
+                        serde_json::json!({
+                            "type": "tunnel_nack",
+                            "tunnel_id": tunnel_id,
+                            "reason": format!("prepare_failed: {e:#}"),
+                        })
+                        .to_string(),
+                    ]
                 }
             }
         }
@@ -1049,6 +1058,44 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&fwd).unwrap()["id"],
             "3"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_that_cannot_be_prepared_is_nacked() {
+        // rat answered the probe, but the request itself fails (here: no socket).
+        let cfg = crate::config::TunnelConfig {
+            rat_socket_path: "/nonexistent/rat.sock".into(),
+            rat_timeout_secs: 1,
+            ..Default::default()
+        };
+        let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let replies = handle_server_message(
+            r#"{"type":"tunnel_request","tunnel_id":"t1","expires_at":"2030-01-01T00:00:00Z"}"#,
+            &mut HashMap::new(),
+            &cfg,
+            &Arc::new(Mutex::new(HashMap::new())),
+            &Arc::new(AtomicBool::new(true)),
+            "",
+            "",
+            None,
+            None,
+            &None,
+            "/nonexistent.sock",
+            &out_tx,
+            30,
+            None,
+        )
+        .await;
+        assert_eq!(replies.len(), 1);
+        let nack: serde_json::Value = serde_json::from_str(&replies[0]).unwrap();
+        assert_eq!(nack["type"], "tunnel_nack");
+        assert_eq!(nack["tunnel_id"], "t1");
+        assert!(
+            nack["reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("prepare_failed")
         );
     }
 
