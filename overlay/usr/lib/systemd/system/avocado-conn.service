@@ -1,8 +1,9 @@
 [Unit]
 Description=Avocado Connect Device Daemon
-# Ordering only: when the tunnels extension is installed, start after rat so
-# the startup probe sees it (otherwise tunnels read as unsupported until the
-# 30 s re-probe, e.g. right after an OTA activation). No dependency.
+# Ordering only: when rat's start job is queued with conn's (boot), start
+# after it, and stop before it at shutdown. No dependency. After an OTA
+# activation the jobs start separately, so conn also re-probes rat fast when
+# its startup probe misses (see agent.rs).
 After=network.target avocado-rat.service
 Wants=network.target
 # Don't start (or restart-loop) until the device has been configured. The

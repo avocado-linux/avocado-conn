@@ -8,6 +8,20 @@ use tracing::{info, warn};
 use crate::config::{IntervalConfig, MqttConfig, RuntimeConfig, TunnelConfig};
 use crate::mqtt;
 
+/// Fast re-probes after a missed startup probe; a device without the tunnels
+/// extension spends about 10 s on these, then settles into the 30 s cadence.
+const FAST_RAT_PROBES: u32 = 5;
+
+/// Delay before the next rat probe: 2 s while fast probes remain, else 30 s.
+fn next_rat_probe_delay(fast_left: &mut u32) -> Duration {
+    if *fast_left > 0 {
+        *fast_left -= 1;
+        Duration::from_secs(2)
+    } else {
+        Duration::from_secs(30)
+    }
+}
+
 async fn probe_rat(socket_path: &str) -> bool {
     tokio::net::UnixStream::connect(socket_path).await.is_ok()
 }
@@ -71,7 +85,9 @@ pub async fn run(
 
     // Rat availability watchdog — re-probes the rat socket every 30s and
     // publishes an updated shadow if the value changes. This handles both
-    // boot races (rat starts after conn) and runtime restarts of rat.
+    // boot races (rat starts after conn) and runtime restarts of rat. If the
+    // startup probe missed rat, the first few re-probes come fast: after an OTA
+    // activation conn can start before rat binds its socket.
     {
         let rat = rat_available.clone();
         let socket_path = rat_socket_path.clone();
@@ -79,10 +95,14 @@ pub async fn run(
         let keepalive = intervals.keepalive_secs;
         let avocadoctl = avocadoctl_socket.clone();
         let rt_cfg = runtime.clone();
+        let mut fast_left = if initial { 0 } else { FAST_RAT_PROBES };
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(30)).await;
+                tokio::time::sleep(next_rat_probe_delay(&mut fast_left)).await;
                 let now_available = probe_rat(&socket_path).await;
+                if now_available {
+                    fast_left = 0;
+                }
                 let was_available = rat.load(Ordering::Relaxed);
                 if now_available != was_available {
                     info!(
@@ -196,4 +216,20 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missed_startup_probe_retries_fast_then_settles() {
+        let mut fast_left = FAST_RAT_PROBES;
+        let delays: Vec<u64> = (0..7)
+            .map(|_| next_rat_probe_delay(&mut fast_left).as_secs())
+            .collect();
+        assert_eq!(delays, [2, 2, 2, 2, 2, 30, 30]);
+        // rat found at startup: straight to the normal cadence.
+        assert_eq!(next_rat_probe_delay(&mut 0).as_secs(), 30);
+    }
 }
