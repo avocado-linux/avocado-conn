@@ -20,6 +20,8 @@ and the project uses [Semantic Versioning](https://semver.org/).
     it's a JSON object with a string `type`. Reserved types (`shadow`,
     `update_result`, `tunnel_*`), malformed lines and lines near 1 MiB or
     larger are dropped.
+- `[tunnel] rat_timeout_secs` (default 30): how long to wait for `rat` before
+  giving up on a request (#25).
 
 ### Changed
 
@@ -33,6 +35,7 @@ and the project uses [Semantic Versioning](https://semver.org/).
   temp file (#23).
 - `tunnel_close` carries `tunnel_id`, so the server closes torn-down
   tunnels (#21).
+- A hung `rat` no longer stops command handling: requests time out (#25).
 
 ### Removed
 
