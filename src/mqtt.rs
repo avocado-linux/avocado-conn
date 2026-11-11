@@ -13,6 +13,76 @@ use crate::config::{MqttConfig, RuntimeConfig, TunnelConfig};
 const DEVICE_PORT_LO: u16 = 49_152;
 const DEVICE_PORT_HI: u16 = 65_535;
 
+/// Serialises runtime updates: one runs at a time, and a nudge that arrives
+/// while one is running buys exactly one more pass after it.
+///
+/// Process-wide rather than threaded through `connect_and_run`: the update runs
+/// on a detached task and has to outlive the MQTT connection that received the
+/// nudge, so a reconnect mid-update does not start a second one.
+static UPDATES: UpdateGate = UpdateGate::new();
+
+struct UpdateGate {
+    in_flight: AtomicBool,
+    requested: AtomicBool,
+}
+
+impl UpdateGate {
+    const fn new() -> Self {
+        Self {
+            in_flight: AtomicBool::new(false),
+            requested: AtomicBool::new(false),
+        }
+    }
+
+    /// Record a nudge. Returns the slot when no update is running; otherwise
+    /// the running one sees `requested` and does another pass.
+    fn nudge(&'static self) -> Option<UpdateSlot> {
+        self.requested.store(true, Ordering::SeqCst);
+        self.claim()
+    }
+
+    fn claim(&'static self) -> Option<UpdateSlot> {
+        self.in_flight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+            .then(|| UpdateSlot(self))
+    }
+
+    /// Run `pass` until no nudge arrived during the last one, then release
+    /// the slot. A pass that ends without activating anything doesn't restart
+    /// conn, and Connect won't re-nudge, so a dropped nudge would be lost.
+    async fn drain<F, Fut>(&'static self, slot: UpdateSlot, mut pass: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let mut slot = Some(slot);
+        while let Some(held) = slot {
+            while self.requested.swap(false, Ordering::SeqCst) {
+                pass().await;
+            }
+            drop(held);
+            // A nudge landing between the last swap and the release found the
+            // slot taken and returned; pick it up here.
+            slot = if self.requested.load(Ordering::SeqCst) {
+                self.claim()
+            } else {
+                None
+            };
+        }
+    }
+}
+
+/// Held while updates run; releases the slot on drop, including on a panic,
+/// so a failed update can never disable updates for the process lifetime.
+struct UpdateSlot(&'static UpdateGate);
+
+impl Drop for UpdateSlot {
+    fn drop(&mut self) {
+        self.0.in_flight.store(false, Ordering::SeqCst);
+    }
+}
+
 /// Shared map from tunnel_id to (expiry_unix_secs, tunnel_prn).
 /// Lives across MQTT reconnects so the watchdog can close expired tunnels
 /// even if the tunnel_closed message was never received.
@@ -389,6 +459,15 @@ async fn handle_server_message(
     if msg["type"].as_u64() == Some(0) {
         match (tuf_url, artifacts_url) {
             (Some(tuf), Some(artifacts)) => {
+                // A nudge carries no target — it just means "fetch whatever your
+                // TUF repo now serves". Running two at once would duplicate the
+                // download and race on the runtime directory and active symlink,
+                // so a nudge mid-update queues one more pass instead.
+                let Some(slot) = UPDATES.nudge() else {
+                    info!("runtime update in progress — will check again after it");
+                    return vec![];
+                };
+
                 info!(
                     tuf_url = tuf,
                     artifacts_url = artifacts,
@@ -402,7 +481,11 @@ async fn handle_server_message(
                 let runtime_clone = _runtime.clone();
                 let keepalive = keepalive_secs;
                 let rat = rat_available.clone();
-                tokio::spawn(async move {
+                tokio::spawn(UPDATES.drain(slot, move || {
+                    let (socket, tuf, jwt, artifacts) =
+                        (socket.clone(), tuf.clone(), jwt.clone(), artifacts.clone());
+                    let (tx, runtime_clone, rat) = (tx.clone(), runtime_clone.clone(), rat.clone());
+                    async move {
                     let event = match varlink_add_from_url(&socket, &tuf, &jwt, Some(&artifacts))
                         .await
                     {
@@ -439,7 +522,8 @@ async fn handle_server_message(
                         }
                     };
                     let _ = tx.send(event.to_string());
-                });
+                    }
+                }));
             }
             _ => warn!(
                 "runtime update available but tuf_url/artifacts_url not set in config; \
@@ -954,6 +1038,48 @@ mod tests {
             PubAck::new(1)
         )))));
         assert!(!forwarded(&Ok(Event::Incoming(Packet::PingResp))));
+    }
+
+    fn gate() -> &'static UpdateGate {
+        Box::leak(Box::new(UpdateGate::new()))
+    }
+
+    #[test]
+    fn update_slot_admits_one_holder_and_survives_a_panic() {
+        let gate = gate();
+        let first = gate.claim();
+        assert!(first.is_some(), "first nudge should take the slot");
+        // Rejected claims must not release the held slot.
+        assert!(gate.claim().is_none());
+        assert!(gate.claim().is_none());
+        drop(first);
+        assert!(gate.claim().is_some(), "reusable once the update finishes");
+
+        let panicked = std::panic::catch_unwind(|| {
+            let _slot = gate.claim().expect("slot should be free");
+            panic!("update blew up");
+        });
+        assert!(panicked.is_err());
+        assert!(gate.claim().is_some(), "a panic must not leak the slot");
+    }
+
+    #[tokio::test]
+    async fn a_nudge_during_an_update_runs_one_more_pass() {
+        let gate = gate();
+        let passes = std::cell::Cell::new(0);
+        let slot = gate.nudge().unwrap();
+        gate.drain(slot, || {
+            passes.set(passes.get() + 1);
+            if passes.get() == 1 {
+                // Two nudges mid-pass: both queue, together buying one pass.
+                assert!(gate.nudge().is_none());
+                assert!(gate.nudge().is_none());
+            }
+            async {}
+        })
+        .await;
+        assert_eq!(passes.get(), 2);
+        assert!(gate.claim().is_some(), "slot released after draining");
     }
 
     #[test]
