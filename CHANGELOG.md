@@ -13,9 +13,13 @@ and the project uses [Semantic Versioning](https://semver.org/).
 ### Added
 
 - Optional local handler bridge over a Unix socket (`[local_handler] socket`).
-  Server messages with a `type` conn doesn't handle are written to the socket
-  as one JSON line each, and every line the handler writes is published on
-  `event/{device_id}`. Off unless configured (#23).
+  Off unless configured (#23).
+  - Server messages whose string `type` conn doesn't handle are written to the
+    socket as compact JSON, one line each.
+  - Each line the handler writes back is published on `event/{device_id}` if
+    it's a JSON object with a string `type`. Reserved types (`shadow`,
+    `update_result`, `tunnel_*`), malformed lines and lines near 1 MiB or
+    larger are dropped.
 
 ### Changed
 
