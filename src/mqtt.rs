@@ -360,7 +360,7 @@ fn tunnel_close_msg(tunnel_id: &str) -> String {
 /// signaling the MQTT loop to exit.
 pub async fn shutdown_tunnels(
     active_tunnels: &ActiveTunnels,
-    rat_socket_path: &str,
+    tunnel_cfg: &TunnelConfig,
     outbox: &tokio::sync::mpsc::UnboundedSender<String>,
 ) {
     // Drain the map atomically so the watchdog won't also try to close these.
@@ -372,7 +372,7 @@ pub async fn shutdown_tunnels(
     for tunnel_id in tunnels {
         info!(tunnel_id, "graceful shutdown — closing tunnel via rat");
         let req = serde_json::json!({"command": "close", "id": tunnel_id});
-        match rat_call(rat_socket_path, &req).await {
+        match rat_call(tunnel_cfg, &req).await {
             Ok(_) => info!(tunnel_id, "graceful shutdown closed tunnel"),
             Err(e) => warn!(tunnel_id, "graceful shutdown rat close failed: {e:#}"),
         }
@@ -389,7 +389,7 @@ pub async fn shutdown_tunnels(
 /// for missed `tunnel_closed` messages due to flaky connections or reconnects.
 pub async fn expiry_watchdog(
     active_tunnels: ActiveTunnels,
-    rat_socket_path: String,
+    tunnel_cfg: TunnelConfig,
     outbox: tokio::sync::mpsc::UnboundedSender<String>,
 ) {
     loop {
@@ -415,7 +415,7 @@ pub async fn expiry_watchdog(
         for tunnel_id in expired {
             warn!(tunnel_id, "tunnel TTL elapsed locally — closing interface");
             let req = serde_json::json!({"command": "close", "id": tunnel_id});
-            match rat_call(&rat_socket_path, &req).await {
+            match rat_call(&tunnel_cfg, &req).await {
                 Ok(_) => info!(tunnel_id, "expiry watchdog closed tunnel"),
                 Err(e) => warn!(tunnel_id, "expiry watchdog rat close failed: {e:#}"),
             }
@@ -631,7 +631,7 @@ async fn handle_server_message(
                 "ttl_secs": ttl_secs,
             });
 
-            if let Err(e) = rat_call(&cfg.rat_socket_path, &open_req).await {
+            if let Err(e) = rat_call(cfg, &open_req).await {
                 error!(tunnel_id, "rat open failed: {e:#}");
             } else {
                 info!(tunnel_id, iface = %prep.iface_name, "WireGuard interface up");
@@ -656,7 +656,7 @@ async fn handle_server_message(
             active_tunnels.lock().unwrap().remove(&tunnel_id);
             info!(tunnel_id, "tunnel_closed — tearing down interface");
             let req = serde_json::json!({"command": "close", "id": tunnel_id});
-            if let Err(e) = rat_call(&cfg.rat_socket_path, &req).await {
+            if let Err(e) = rat_call(cfg, &req).await {
                 warn!(tunnel_id, "rat close failed (may already be down): {e:#}");
             }
             vec![]
@@ -682,7 +682,7 @@ async fn handle_server_message(
                 map.insert(tunnel_id.clone(), (expiry, prn));
             }
             let req = serde_json::json!({"command": "extend", "id": tunnel_id, "secs": secs});
-            if let Err(e) = rat_call(&cfg.rat_socket_path, &req).await {
+            if let Err(e) = rat_call(cfg, &req).await {
                 warn!(tunnel_id, "rat extend failed: {e:#}");
             }
             vec![]
@@ -851,7 +851,15 @@ async fn varlink_add_from_url(
 }
 
 /// Call rat over Unix socket, return the response JSON.
-async fn rat_call(socket_path: &str, request: &serde_json::Value) -> Result<serde_json::Value> {
+/// Send one request to `rat`, giving up after `rat_timeout_secs`.
+async fn rat_call(cfg: &TunnelConfig, request: &serde_json::Value) -> Result<serde_json::Value> {
+    let limit = Duration::from_secs(cfg.rat_timeout_secs);
+    tokio::time::timeout(limit, rat_exchange(&cfg.rat_socket_path, request))
+        .await
+        .map_err(|_| anyhow::anyhow!("rat did not answer within {limit:?}"))?
+}
+
+async fn rat_exchange(socket_path: &str, request: &serde_json::Value) -> Result<serde_json::Value> {
     let stream = UnixStream::connect(socket_path).await?;
     let (reader, mut writer) = stream.into_split();
     let mut payload = serde_json::to_string(request)?;
@@ -880,7 +888,7 @@ async fn prepare_tunnel(tunnel_id: &str, cfg: &TunnelConfig) -> Result<TunnelPre
         "lo": lo,
         "hi": hi,
     });
-    let resp = rat_call(&cfg.rat_socket_path, &req).await?;
+    let resp = rat_call(cfg, &req).await?;
     let listen_port = resp["data"]["port"]
         .as_u64()
         .ok_or_else(|| anyhow::anyhow!("rat find_port returned no port"))?
@@ -973,6 +981,30 @@ fn unix_now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_hung_rat_times_out() {
+        let dir = std::env::temp_dir().join(format!("conn-rat-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sock = dir.join("rat.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        // Accept and hold the connection without ever answering.
+        let _hold = tokio::spawn(async move {
+            let (_conn, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await
+        });
+        let cfg = TunnelConfig {
+            rat_socket_path: sock.to_string_lossy().into(),
+            rat_timeout_secs: 1,
+            ..Default::default()
+        };
+        let err = rat_call(&cfg, &serde_json::json!({"op": "x"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("did not answer"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     async fn handle(text: &str, lh: Option<&tokio::sync::mpsc::Sender<String>>) -> Vec<String> {
         let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();

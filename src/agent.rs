@@ -62,10 +62,10 @@ pub async fn run(
     // Expiry watchdog — independent of MQTT connection state.
     {
         let tunnels = active_tunnels.clone();
-        let socket_path = rat_socket_path.clone();
+        let cfg = tunnel_config.clone();
         let tx = outbox_tx.clone();
         tokio::spawn(async move {
-            mqtt::expiry_watchdog(tunnels, socket_path, tx).await;
+            mqtt::expiry_watchdog(tunnels, cfg, tx).await;
         });
     }
 
@@ -118,6 +118,7 @@ pub async fn run(
     // MQTT connect loop with auto-reconnect.
     let mqtt_handle = tokio::spawn({
         let tunnels = active_tunnels.clone();
+        let tunnel_config = tunnel_config.clone();
         let mut shutdown_rx = shutdown_rx;
         let outbox_tx_loop = outbox_tx.clone();
         async move {
@@ -184,7 +185,7 @@ pub async fn run(
 
     info!("shutting down — closing active tunnels");
 
-    mqtt::shutdown_tunnels(&active_tunnels, &rat_socket_path, &outbox_tx).await;
+    mqtt::shutdown_tunnels(&active_tunnels, &tunnel_config, &outbox_tx).await;
 
     let _ = shutdown_tx.send(true);
 
