@@ -1,6 +1,9 @@
 [Unit]
 Description=Avocado Connect Device Daemon
-After=network.target
+# Ordering only: when the tunnels extension is installed, start after rat so
+# the startup probe sees it (otherwise tunnels read as unsupported until the
+# 30 s re-probe, e.g. right after an OTA activation). No dependency.
+After=network.target avocado-rat.service
 Wants=network.target
 # Don't start (or restart-loop) until the device has been configured. The
 # extension ships config.toml.example, not config.toml — provisioning drops
