@@ -22,6 +22,7 @@ pub async fn run(
     artifacts_url: Option<String>,
     runtime: Option<RuntimeConfig>,
     avocadoctl_socket: String,
+    local_handler_socket: Option<String>,
 ) -> Result<()> {
     let initial = probe_rat(&tunnel_config.rat_socket_path).await;
     let rat_available = Arc::new(AtomicBool::new(initial));
@@ -41,6 +42,22 @@ pub async fn run(
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     let rat_socket_path = tunnel_config.rat_socket_path.clone();
+
+    // Optional local handler bridge; None leaves message handling unchanged.
+    // Its events get their own bounded queue so a chatty handler can't grow
+    // memory or crowd out conn's own events during an MQTT outage. Without a
+    // handler the sender is just held, so the queue never yields.
+    let (handler_events_tx, mut handler_events_rx) =
+        tokio::sync::mpsc::channel::<String>(crate::local_handler::EVENTS);
+    let local_handler = local_handler_socket.map(|socket| {
+        let (tx, rx) = tokio::sync::mpsc::channel(crate::local_handler::QUEUE);
+        tokio::spawn(crate::local_handler::run(
+            socket,
+            rx,
+            handler_events_tx.clone(),
+        ));
+        tx
+    });
 
     // Expiry watchdog — independent of MQTT connection state.
     {
@@ -111,6 +128,7 @@ pub async fn run(
                     tunnel_config.clone(),
                     tunnels.clone(),
                     &mut outbox_rx,
+                    &mut handler_events_rx,
                     &outbox_tx_loop,
                     &mut shutdown_rx,
                     rat_available.clone(),
@@ -119,6 +137,7 @@ pub async fn run(
                     artifacts_url.as_deref(),
                     runtime.clone(),
                     &avocadoctl_socket,
+                    local_handler.as_ref(),
                 )
                 .await
                 {
