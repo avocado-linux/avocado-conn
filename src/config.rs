@@ -132,6 +132,14 @@ pub struct TunnelConfig {
     /// Optional upper bound for the WireGuard listen port range.
     #[serde(default)]
     pub wg_port_hi: Option<u16>,
+    /// Seconds to wait for `rat` to answer a request. Requests run inline in
+    /// the MQTT loop, so a hung `rat` would otherwise stop command handling.
+    #[serde(default = "default_rat_timeout_secs")]
+    pub rat_timeout_secs: u64,
+}
+
+fn default_rat_timeout_secs() -> u64 {
+    30
 }
 
 fn default_rat_socket_path() -> String {
@@ -154,6 +162,7 @@ impl Default for TunnelConfig {
             cidr_blocks: default_cidr_blocks(),
             wg_port_lo: None,
             wg_port_hi: None,
+            rat_timeout_secs: default_rat_timeout_secs(),
         }
     }
 }
@@ -368,6 +377,14 @@ mod tests {
         let parent = Path::new("state/claimed_state.json").parent().unwrap();
         assert_eq!(parent.parent(), Some(Path::new("")));
         sync_dir(parent.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn rat_timeout_defaults_to_30s_and_is_configurable() {
+        let cfg: AgentConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.tunnel.rat_timeout_secs, 30);
+        let cfg: AgentConfig = toml::from_str("[tunnel]\nrat_timeout_secs = 5").unwrap();
+        assert_eq!(cfg.tunnel.rat_timeout_secs, 5);
     }
 
     #[test]

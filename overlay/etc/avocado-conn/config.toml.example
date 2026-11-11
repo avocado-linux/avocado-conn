@@ -54,6 +54,8 @@ keepalive_secs = 30
 
 # [tunnel]
 # rat_socket_path = "/tmp/avocado-rat.sock"
+# Seconds to wait for rat to answer before giving up on a request.
+# rat_timeout_secs = 30
 
 # ---------------------------------------------------------------------------
 # Manual MQTT provisioning (option 2)
