@@ -252,6 +252,11 @@ impl AgentConfig {
         if self.claim_token.is_some() {
             anyhow::bail!("set claim_token or claim_token_file, not both");
         }
+        // A claimed device runs on its saved credentials: a leftover file,
+        // even an empty or unreadable one, must not stop it starting.
+        if self.is_claimed() {
+            return Ok(());
+        }
         match fs::read_to_string(path) {
             Ok(s) if s.trim().is_empty() => anyhow::bail!("claim_token_file {path} is empty"),
             Ok(s) => self.claim_token = Some(s.trim().to_string()),
@@ -488,6 +493,10 @@ mod tests {
         let cfg = AgentConfig::load(&conf).unwrap();
         assert!(cfg.claim_token.is_none() && !cfg.needs_claim());
         assert_eq!(cfg.missing_claim_token_file(), None);
+
+        // A claimed device ignores a leftover file, even an empty one.
+        fs::write(&token, "").unwrap();
+        assert!(AgentConfig::load(&conf).unwrap().claim_token.is_none());
 
         // Without the option the file is kept.
         fs::write(&token, "tok-123").unwrap();
