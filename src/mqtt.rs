@@ -97,6 +97,23 @@ struct TunnelPrep {
     tunnel_prn: String,
 }
 
+/// The `tunnel_ack` + `tunnel_configure` pair for a prepared tunnel.
+fn tunnel_ack_and_configure(tunnel_id: &str, prep: &TunnelPrep, cfg: &TunnelConfig) -> Vec<String> {
+    let ack = serde_json::json!({"type": "tunnel_ack", "tunnel_id": tunnel_id}).to_string();
+    let configure = serde_json::json!({
+        "type": "tunnel_configure",
+        "tunnel_id": tunnel_id,
+        "tunnel_prn": prep.tunnel_prn,
+        "device_public_key": derive_public_key(&prep.private_key).unwrap_or_default(),
+        "device_endpoint_ip": outbound_ip(),
+        "device_endpoint_port": prep.listen_port,
+        "device_proxy_port": cfg.device_proxy_port,
+        "cidr_blocks": cfg.cidr_blocks,
+    })
+    .to_string();
+    vec![ack, configure]
+}
+
 /// Largest MQTT packet accepted or sent. Fits both brokers Connect runs:
 /// EMQX's default `max_packet_size` (1 MiB) and RabbitMQ's far larger
 /// authenticated limit. rumqttc grows its read buffer on demand, so this is
@@ -552,39 +569,41 @@ async fn handle_server_message(
             let expires_at = msg["expires_at"].as_str().unwrap_or("").to_string();
             info!(tunnel_id, "received tunnel_request");
 
+            // A repeat (the server re-sends until the state moves) gets the same
+            // answer. Preparing again would pick a new key and port that the
+            // server, already past `requested`, would never learn.
+            if let Some(prep) = pending.get(&tunnel_id) {
+                info!(
+                    tunnel_id,
+                    "repeated tunnel_request; re-sending the same ack + configure"
+                );
+                return tunnel_ack_and_configure(&tunnel_id, prep, cfg);
+            }
+
             match prepare_tunnel(&tunnel_id, cfg).await {
                 Ok(prep) => {
-                    let ack = serde_json::json!({"type": "tunnel_ack", "tunnel_id": tunnel_id})
-                        .to_string();
-
-                    let configure = serde_json::json!({
-                        "type": "tunnel_configure",
-                        "tunnel_id": tunnel_id,
-                        "tunnel_prn": tunnel_prn,
-                        "device_public_key": derive_public_key(&prep.private_key).unwrap_or_default(),
-                        "device_endpoint_ip": outbound_ip(),
-                        "device_endpoint_port": prep.listen_port,
-                        "device_proxy_port": cfg.device_proxy_port,
-                        "cidr_blocks": cfg.cidr_blocks,
-                    })
-                    .to_string();
-
-                    let tunnel_id_clone = tunnel_id.clone();
                     let prep = TunnelPrep {
                         expires_at,
                         tunnel_prn,
                         ..prep
                     };
+                    let replies = tunnel_ack_and_configure(&tunnel_id, &prep, cfg);
+                    info!(tunnel_id, "sent tunnel_ack + tunnel_configure");
                     pending.insert(tunnel_id, prep);
-                    info!(
-                        tunnel_id = tunnel_id_clone,
-                        "sent tunnel_ack + tunnel_configure"
-                    );
-                    vec![ack, configure]
+                    replies
                 }
                 Err(e) => {
+                    // Tell the server, or the tunnel sits at "requested"
+                    // until it expires with no reason anywhere but here.
                     error!(tunnel_id, "failed to prepare tunnel: {e:#}");
-                    vec![]
+                    vec![
+                        serde_json::json!({
+                            "type": "tunnel_nack",
+                            "tunnel_id": tunnel_id,
+                            "reason": format!("prepare_failed: {e:#}"),
+                        })
+                        .to_string(),
+                    ]
                 }
             }
         }
@@ -1049,6 +1068,94 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&fwd).unwrap()["id"],
             "3"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeated_tunnel_request_gets_the_same_answer() {
+        // rat is unreachable, so preparing again would nack: a repeat must be
+        // answered from the pending entry, with the same key and port.
+        let cfg = crate::config::TunnelConfig {
+            rat_socket_path: "/nonexistent/rat.sock".into(),
+            rat_timeout_secs: 1,
+            ..Default::default()
+        };
+        let key = generate_wg_private_key();
+        let mut pending = HashMap::new();
+        pending.insert(
+            "t1".to_string(),
+            TunnelPrep {
+                private_key: key.clone(),
+                listen_port: 51000,
+                iface_name: "avot1".into(),
+                expires_at: "2030-01-01T00:00:00Z".into(),
+                tunnel_prn: String::new(),
+            },
+        );
+        let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let replies = handle_server_message(
+            r#"{"type":"tunnel_request","tunnel_id":"t1","expires_at":"2030-01-01T00:00:00Z"}"#,
+            &mut pending,
+            &cfg,
+            &Arc::new(Mutex::new(HashMap::new())),
+            &Arc::new(AtomicBool::new(true)),
+            "",
+            "",
+            None,
+            None,
+            &None,
+            "/nonexistent.sock",
+            &out_tx,
+            30,
+            None,
+        )
+        .await;
+        assert_eq!(replies.len(), 2, "{replies:?}");
+        let configure: serde_json::Value = serde_json::from_str(&replies[1]).unwrap();
+        assert_eq!(configure["type"], "tunnel_configure");
+        assert_eq!(configure["device_endpoint_port"], 51000);
+        assert_eq!(
+            configure["device_public_key"],
+            derive_public_key(&key).unwrap()
+        );
+        assert!(pending.contains_key("t1"));
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_that_cannot_be_prepared_is_nacked() {
+        // rat answered the probe, but the request itself fails (here: no socket).
+        let cfg = crate::config::TunnelConfig {
+            rat_socket_path: "/nonexistent/rat.sock".into(),
+            rat_timeout_secs: 1,
+            ..Default::default()
+        };
+        let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let replies = handle_server_message(
+            r#"{"type":"tunnel_request","tunnel_id":"t1","expires_at":"2030-01-01T00:00:00Z"}"#,
+            &mut HashMap::new(),
+            &cfg,
+            &Arc::new(Mutex::new(HashMap::new())),
+            &Arc::new(AtomicBool::new(true)),
+            "",
+            "",
+            None,
+            None,
+            &None,
+            "/nonexistent.sock",
+            &out_tx,
+            30,
+            None,
+        )
+        .await;
+        assert_eq!(replies.len(), 1);
+        let nack: serde_json::Value = serde_json::from_str(&replies[0]).unwrap();
+        assert_eq!(nack["type"], "tunnel_nack");
+        assert_eq!(nack["tunnel_id"], "t1");
+        assert!(
+            nack["reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("prepare_failed")
         );
     }
 
