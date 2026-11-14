@@ -38,6 +38,16 @@ pub struct AgentConfig {
     /// by calling POST {api_url}/api/device/claim.
     #[serde(default)]
     pub claim_token: Option<String>,
+    /// Read the claim token from this file instead of `claim_token`, e.g. a
+    /// file placed on /var at provision so the token stays out of the image.
+    /// Not needed once the device is claimed.
+    #[serde(default)]
+    pub claim_token_file: Option<String>,
+    /// Delete `claim_token_file` once the claim credentials are saved.
+    /// Default false. A device whose saved credentials are later lost then
+    /// cannot claim again until a new token is provided.
+    #[serde(default)]
+    pub remove_claim_token_file: bool,
     /// Device ID provider name. Required when `claim_token` is set.
     /// Built-in: "dmi", "devicetree-serial", "rpi-serial", "imx-uid", "nic-mac"
     /// External: "file:<path>", "uboot-env:<var>", "exec:<path> [args...]"
@@ -200,6 +210,8 @@ impl Default for AgentConfig {
             runtime: None,
             avocadoctl_socket: default_avocadoctl_socket(),
             claim_token: None,
+            claim_token_file: None,
+            remove_claim_token_file: false,
             device_id_source: None,
             mqtt_host: default_mqtt_host(),
             mqtt_port: default_mqtt_port(),
@@ -225,8 +237,60 @@ impl AgentConfig {
             return Ok(Self::default());
         }
         let data = fs::read_to_string(path)?;
-        let config: AgentConfig = toml::from_str(&data)?;
+        let mut config: AgentConfig = toml::from_str(&data)?;
+        config.read_claim_token_file()?;
         Ok(config)
+    }
+
+    /// Fill `claim_token` from `claim_token_file`. A missing file leaves it
+    /// unset: fine once claimed (it may have been removed after the claim),
+    /// and reported by `missing_claim_token_file` otherwise.
+    fn read_claim_token_file(&mut self) -> Result<()> {
+        let Some(path) = &self.claim_token_file else {
+            return Ok(());
+        };
+        if self.claim_token.is_some() {
+            anyhow::bail!("set claim_token or claim_token_file, not both");
+        }
+        // A claimed device runs on its saved credentials: a leftover file,
+        // even an empty or unreadable one, must not stop it starting.
+        if self.is_claimed() {
+            return Ok(());
+        }
+        match fs::read_to_string(path) {
+            Ok(s) if s.trim().is_empty() => anyhow::bail!("claim_token_file {path} is empty"),
+            Ok(s) => self.claim_token = Some(s.trim().to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).with_context(|| format!("reading claim_token_file {path}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The configured token file when an unclaimed device has none to read.
+    pub fn missing_claim_token_file(&self) -> Option<&str> {
+        match &self.claim_token_file {
+            Some(path) if self.claim_token.is_none() && !self.is_claimed() => Some(path),
+            _ => None,
+        }
+    }
+
+    /// With `remove_claim_token_file`, delete the token file of a claimed
+    /// device. Runs on every start, so a crash between saving the claim and
+    /// removing the file is cleaned up next time.
+    pub fn remove_claim_token_file_if_claimed(&self) {
+        let Some(path) = &self.claim_token_file else {
+            return;
+        };
+        if !self.remove_claim_token_file || !self.is_claimed() {
+            return;
+        }
+        match fs::remove_file(path) {
+            Ok(()) => tracing::info!(path = %path, "removed claim token file"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(path = %path, error = %e, "could not remove claim token file"),
+        }
     }
 
     /// Resolve the MQTT config: check [mqtt] section first, then saved claim
@@ -377,6 +441,75 @@ mod tests {
         let parent = Path::new("state/claimed_state.json").parent().unwrap();
         assert_eq!(parent.parent(), Some(Path::new("")));
         sync_dir(parent.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_claim_token_file_is_read_and_removed_after_the_claim() {
+        let dir = std::env::temp_dir().join(format!("conn-token-file-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let token = dir.join("claim_token");
+        let conf = dir.join("config.toml");
+        let write_conf = |extra: &str| {
+            fs::write(
+                &conf,
+                format!(
+                    "data_dir = {:?}\nclaim_token_file = {:?}\n{extra}",
+                    dir.join("state"),
+                    token
+                ),
+            )
+            .unwrap()
+        };
+
+        // Unclaimed and no file: reported, so the daemon idles instead of
+        // exiting into a systemd restart loop.
+        write_conf("remove_claim_token_file = true");
+        let cfg = AgentConfig::load(&conf).unwrap();
+        assert_eq!(
+            cfg.missing_claim_token_file(),
+            Some(token.to_str().unwrap())
+        );
+
+        fs::write(&token, "tok-123\n").unwrap();
+        let cfg = AgentConfig::load(&conf).unwrap();
+        assert_eq!(cfg.claim_token.as_deref(), Some("tok-123"));
+        assert!(cfg.needs_claim());
+
+        // Not claimed yet: the file stays.
+        cfg.remove_claim_token_file_if_claimed();
+        assert!(token.exists());
+
+        let state: ClaimedState = serde_json::from_str(
+            r#"{"device_id":"d1","mqtt":{"username":"u","password":"p","client_id":"c"},
+                "tuf_url":null,"artifacts_url":null,"claimed_at":"now"}"#,
+        )
+        .unwrap();
+        cfg.save_claimed_state(&state).unwrap();
+        cfg.remove_claim_token_file_if_claimed();
+        assert!(!token.exists());
+
+        // Restart after removal: claimed, no token needed.
+        let cfg = AgentConfig::load(&conf).unwrap();
+        assert!(cfg.claim_token.is_none() && !cfg.needs_claim());
+        assert_eq!(cfg.missing_claim_token_file(), None);
+
+        // A claimed device ignores a leftover file, even an empty one.
+        fs::write(&token, "").unwrap();
+        assert!(AgentConfig::load(&conf).unwrap().claim_token.is_none());
+
+        // Without the option the file is kept.
+        fs::write(&token, "tok-123").unwrap();
+        write_conf("");
+        AgentConfig::load(&conf)
+            .unwrap()
+            .remove_claim_token_file_if_claimed();
+        assert!(token.exists());
+
+        // Both ways of giving the token is a config error.
+        write_conf("claim_token = \"inline\"");
+        assert!(AgentConfig::load(&conf).is_err());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

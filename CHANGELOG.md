@@ -8,6 +8,14 @@ and the project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `claim_token_file`: read the claim token from a file instead of
+  `claim_token`, e.g. one placed on `/var` at provision so the token stays
+  out of the image and extensions. With `remove_claim_token_file = true`,
+  conn deletes the file once the claim credentials are saved. Both are off
+  by default.
+
 ## [0.2.0] - 2026-11-10
 
 ### Added

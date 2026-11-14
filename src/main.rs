@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use tracing::info;
+use tracing::{error, info};
 
 mod agent;
 mod claim;
@@ -76,6 +76,13 @@ async fn run_daemon(config: AgentConfig) -> Result<()> {
     let (mqtt_cfg, tuf_url, artifacts_url) = if let Some(state) = config.load_claimed_state()? {
         info!(device_id = %state.device_id, "loaded saved credentials");
         (state.mqtt, state.tuf_url, state.artifacts_url)
+    } else if let Some(path) = config.missing_claim_token_file() {
+        // Restarting can't make the file appear: idle like a terminal claim
+        // rejection (ENG-1822) rather than loop on systemd restarts. Placing
+        // the file and restarting the service resumes the claim.
+        error!(path = %path, "claim_token_file not found and device not claimed; idling until restart");
+        shutdown_signal().await;
+        return Ok(());
     } else if config.needs_claim() {
         info!("no saved credentials, starting claim flow");
 
@@ -116,6 +123,8 @@ async fn run_daemon(config: AgentConfig) -> Result<()> {
             config.artifacts_url.clone(),
         )
     };
+
+    config.remove_claim_token_file_if_claimed();
 
     // Phase 2: Run the MQTT agent with resolved credentials.
     info!(host = %mqtt_cfg.host, port = mqtt_cfg.port, "starting avocado-conn");

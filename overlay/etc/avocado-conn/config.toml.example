@@ -24,6 +24,13 @@ api_url = "https://connect.example.com"
 # Claim token obtained from the web UI
 # claim_token = "YOUR_CLAIM_TOKEN"
 
+# Or read it from a file instead, e.g. one placed on /var at provision so the
+# token isn't baked into the image or an extension. Set one or the other.
+# claim_token_file = "/var/lib/avocado/connect/claim_token"
+# Delete that file once the device has claimed and its credentials are saved.
+# If those credentials are later lost, the device needs a new token to claim.
+# remove_claim_token_file = true
+
 # How to derive the hardware fingerprint sent during claim.
 #
 # Built-in providers (compiled via Cargo feature flags):
