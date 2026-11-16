@@ -8,13 +8,29 @@ and the project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-16
+
 ### Added
 
 - `claim_token_file`: read the claim token from a file instead of
   `claim_token`, e.g. one placed on `/var` at provision so the token stays
   out of the image and extensions. With `remove_claim_token_file = true`,
   conn deletes the file once the claim credentials are saved. Both are off
-  by default.
+  by default. A claimed device ignores the file; an unclaimed one with no
+  file idles until restarted instead of crash-looping (#27).
+
+### Fixed
+
+- A tunnel whose local setup fails is nacked (`prepare_failed: <error>`)
+  instead of left hanging (#26).
+- A repeated `tunnel_request` for a pending tunnel gets the same ack and
+  configure, so server re-sends are safe (#26).
+- conn starts after `avocado-rat.service`, and a missed rat probe at startup
+  is retried every 2 s for 10 s before settling to 30 s (#26).
+
+### Security
+
+- Bump `quinn-udp` to 0.5.16 for RUSTSEC-2026-0538 (#28).
 
 ## [0.2.0] - 2026-11-10
 
@@ -77,7 +93,8 @@ and the project uses [Semantic Versioning](https://semver.org/).
 - A 4xx on device claim is terminal, and `Retry-After` is honoured (#7).
 - A single rustls 0.23 crypto provider (#12).
 
-[Unreleased]: https://github.com/avocado-linux/avocado-conn/compare/0.2.0...HEAD
+[Unreleased]: https://github.com/avocado-linux/avocado-conn/compare/0.3.0...HEAD
+[0.3.0]: https://github.com/avocado-linux/avocado-conn/compare/0.2.0...0.3.0
 [0.2.0]: https://github.com/avocado-linux/avocado-conn/compare/0.1.1...0.2.0
 [0.1.1]: https://github.com/avocado-linux/avocado-conn/compare/0.1.0...0.1.1
 [0.1.0]: https://github.com/avocado-linux/avocado-conn/releases/tag/0.1.0
