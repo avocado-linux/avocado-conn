@@ -1,12 +1,11 @@
 name: Extension Release
 
 # Package + publish the avocado-ext-connect extension on a version tag. The extension
-# version TRACKS THE PACKAGED PROGRAM: it is read from Cargo.toml ([package] version) and
-# passed to the reusable helper as `ext-version`, which exports it as AVOCADO_EXT_VERSION
-# so the `version: '{{ env.AVOCADO_EXT_VERSION }}'` template in avocado.yaml resolves at
-# package time. The pushed tag must equal the Cargo.toml version (the helper guards it).
+# version TRACKS THE PACKAGED PROGRAM: avocado.yaml holds the same version as Cargo.toml
+# ([package] version), and this workflow fails when they differ. The pushed tag must equal
+# the Cargo.toml version (the helper guards it).
 #
-# Release flow: bump Cargo.toml version -> tag the same value -> push tag.
+# Release flow: bump the version in Cargo.toml and avocado.yaml -> tag the same value -> push tag.
 on:
   push:
     tags:
@@ -31,6 +30,7 @@ jobs:
             exit 1
           fi
           echo "Program version (Cargo.toml): $v"
+          ./scripts/check-ext-version.sh
           echo "version=$v" >> "$GITHUB_OUTPUT"
 
   publish:
