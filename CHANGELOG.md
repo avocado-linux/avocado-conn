@@ -8,6 +8,13 @@ and the project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `avocado.yaml` holds the extension version (`0.3.0`) instead of
+  `{{ env.AVOCADO_EXT_VERSION }}`. A project that builds the extension from a
+  git source no longer needs `AVOCADO_EXT_VERSION`, and two builds of one
+  commit give the same version. CI fails when it differs from `Cargo.toml`.
+
 ## [0.3.0] - 2026-11-16
 
 ### Added
