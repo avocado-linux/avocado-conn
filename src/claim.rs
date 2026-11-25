@@ -120,6 +120,10 @@ const MAX_BACKOFF: Duration = Duration::from_secs(300);
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(3600);
 /// Multiplicative jitter band applied to computed backoff (±20%).
 const JITTER_RATIO: f64 = 0.20;
+/// Retry interval for `402 limit_reached` when the server sends no
+/// `Retry-After`. A slot frees only when an admin removes a device or upgrades
+/// the plan, so polling faster than this just adds load.
+const LIMIT_REACHED_BACKOFF: Duration = Duration::from_secs(600);
 
 /// Parse RFC 9110 §10.2.3 `Retry-After` as delta-seconds.
 ///
@@ -143,9 +147,11 @@ fn jittered_backoff(attempt: u32) -> Duration {
     let base = INITIAL_BACKOFF.as_secs_f64();
     let cap = MAX_BACKOFF.as_secs_f64();
     let exp = base * 2f64.powi(attempt.saturating_sub(1).min(16) as i32);
-    let target = exp.min(cap);
-    let jitter = rand::thread_rng().gen_range((1.0 - JITTER_RATIO)..=(1.0 + JITTER_RATIO));
-    Duration::from_secs_f64((target * jitter).max(base))
+    jitter(Duration::from_secs_f64(exp.min(cap))).max(INITIAL_BACKOFF)
+}
+
+fn jitter(d: Duration) -> Duration {
+    d.mul_f64(rand::thread_rng().gen_range((1.0 - JITTER_RATIO)..=(1.0 + JITTER_RATIO)))
 }
 
 /// Classify an HTTP response that was not 2xx.
@@ -155,6 +161,9 @@ fn jittered_backoff(attempt: u32) -> Duration {
 /// - `409 reclaim_pending` → Transient (honors `Retry-After`). Server-side
 ///   workflow that completes only after admin approval; the same fingerprint
 ///   will eventually succeed without device-side input changes.
+/// - `402 limit_reached` → Transient, every `Retry-After` or
+///   `LIMIT_REACHED_BACKOFF` (±20%). The org is at its device limit; the
+///   claim succeeds unchanged once a slot frees or the plan is upgraded.
 /// - Any other 4xx → Permanent. A well-formed request that returns 400/401/
 ///   403/404/409/422 will keep returning the same error on retry. This
 ///   prevents the 409 `identifier_taken` retry storm and every analogous case
@@ -181,6 +190,13 @@ fn classify(
             code,
             message,
             retry_after,
+        };
+    }
+    if status == StatusCode::PAYMENT_REQUIRED && code == "limit_reached" {
+        return AttemptError::Transient {
+            code,
+            message,
+            retry_after: retry_after.or_else(|| Some(jitter(LIMIT_REACHED_BACKOFF))),
         };
     }
     if status.is_client_error() {
@@ -328,7 +344,8 @@ async fn claim_once(config: &AgentConfig) -> Result<ClaimedState, AttemptError> 
 /// - Permanent (409 identifier_taken, invalid/expired token, malformed
 ///   request, etc.) → returns `PermanentClaimError` immediately. Callers
 ///   should idle rather than crash-loop — a process restart retries once.
-/// - Transient (5xx, 429, network) → retries indefinitely. Honors
+/// - Transient (5xx, 429, 409 reclaim_pending, 402 limit_reached, network)
+///   → retries indefinitely. Honors
 ///   `Retry-After` when present on transient HTTP responses (e.g., 429 or
 ///   503); falls back to jittered backoff otherwise (5s → 300s, ±20%).
 pub async fn claim_with_retry(config: &AgentConfig) -> Result<ClaimedState, PermanentClaimError> {
@@ -503,6 +520,53 @@ mod tests {
                 "expected Permanent for status {status}"
             );
         }
+    }
+
+    #[test]
+    fn classify_402_limit_reached_is_transient_with_long_backoff() {
+        let err = classify(
+            StatusCode::PAYMENT_REQUIRED,
+            "limit_reached".into(),
+            "msg".into(),
+            None,
+        );
+        match err {
+            AttemptError::Transient {
+                retry_after: Some(d),
+                ..
+            } => {
+                assert!(d >= LIMIT_REACHED_BACKOFF.mul_f64(1.0 - JITTER_RATIO));
+                assert!(d <= LIMIT_REACHED_BACKOFF.mul_f64(1.0 + JITTER_RATIO));
+            }
+            other => panic!("expected Transient with a delay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_402_limit_reached_honors_retry_after() {
+        let err = classify(
+            StatusCode::PAYMENT_REQUIRED,
+            "limit_reached".into(),
+            "msg".into(),
+            Some(Duration::from_secs(90)),
+        );
+        match err {
+            AttemptError::Transient { retry_after, .. } => {
+                assert_eq!(retry_after, Some(Duration::from_secs(90)));
+            }
+            other => panic!("expected Transient, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_402_other_code_is_permanent() {
+        let err = classify(
+            StatusCode::PAYMENT_REQUIRED,
+            "payment_required".into(),
+            "msg".into(),
+            None,
+        );
+        assert!(matches!(err, AttemptError::Permanent(_)));
     }
 
     #[test]
